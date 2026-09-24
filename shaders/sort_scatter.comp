@@ -1,0 +1,56 @@
+// sort_scatter — GPU radix sort pass C: scatter elements to their sorted
+// position for this digit.
+// Slot = per-WG scatter base (global_hist[wg*256+digit], written by the scan
+// shader) + STABLE rank of this element among same-digit elements of this
+// workgroup. Rank is computed deterministically by counting same-digit
+// predecessors in the tile (shared memory) — ascending tile-index order, so
+// ties keep global ascending index order: the sort is stable.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer KeysIn { uint keys_in[]; };
+layout(std430, binding = 1) readonly buffer ValsIn { uint vals_in[]; };
+layout(std430, binding = 2) readonly buffer Scanned { uint scanned[]; };     // (consistency check only)
+layout(std430, binding = 3) writeonly buffer KeysOut { uint keys_out[]; };
+layout(std430, binding = 4) writeonly buffer ValsOut { uint vals_out[]; };
+layout(std430, binding = 5) readonly buffer WgBase { uint wg_base_global[]; }; // global_hist rewritten by scan
+layout(std430, binding = 6) buffer PadA { uint pad_a[]; };                     // unused, kept bound
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint shift;
+    uint groups;
+    uint pad;
+} pc;
+
+shared uint s_keys[256]; // this workgroup's key tile (for stable rank counts)
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint idx = gl_WorkGroupID.x * 256u + lid;
+
+    // stage the tile once; invalid lanes store a digit-255 sentinel key
+    uint key = 0xFFFFFFFFu;
+    if (idx < pc.n) key = keys_in[idx];
+    s_keys[lid] = key;
+    barrier();
+    memoryBarrierShared();
+
+    if (idx >= pc.n) return;
+    uint val = vals_in[idx];
+    uint digit = (key >> pc.shift) & 0xFFu;
+
+    // stable rank: count same-digit elements at earlier tile positions
+    uint rank = 0;
+    for (uint j = 0; j < 256u; j++) {
+        if (j >= lid) break;
+        if (((s_keys[j] >> pc.shift) & 0xFFu) == digit) rank++;
+    }
+
+    uint base = wg_base_global[gl_WorkGroupID.x * 256u + digit];
+    uint slot = base + rank;
+
+    keys_out[slot] = key;
+    vals_out[slot] = val;
+}

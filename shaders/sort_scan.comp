@@ -1,0 +1,72 @@
+// sort_scan — GPU radix sort pass B: turn per-workgroup histograms into
+// scatter offsets.
+//
+// Outputs (both consumed by sort_scatter):
+//   scanned[bin]           = number of elements with digit < bin
+//                            (global exclusive prefix over bins)
+//   global_hist[g*256+bin] (REWRITTEN in place) = scanned[bin] + count of
+//       same-digit elements in all workgroups < g  (per-WG scatter base)
+//
+// Single workgroup, 256 threads. Steps:
+//   1. per-bin total = sum over g of global_hist[g*256+bin]
+//   2. exclusive scan over bins -> scanned[bin]
+//   3. per-(g,bin) exclusive scan over g (fixed 256x256 transpose loop,
+//      parallelized as: each thread handles one bin, walks g) -> rewrite
+//      global_hist in place: new[g*256+bin] = scanned[bin] + sum_{g'<g} hist[g'*256+bin]
+// Stability: ties within a digit scatter in ascending (g, then in-WG atomic
+// order = ascending index) — matches std::stable_sort on (cell, index).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer GlobalHist { uint global_hist[]; };
+layout(std430, binding = 1) buffer Scanned { uint scanned[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint shift;
+    uint groups; // number of workgroups
+    uint pad;
+} pc;
+
+shared uint col_total[256];   // per-bin totals
+shared uint col_scan[2][256]; // Hillis-Steele scratch
+
+void main() {
+    uint bin = gl_LocalInvocationID.x;
+
+    // 1. per-bin total across workgroups
+    uint total = 0;
+    for (uint g = 0; g < pc.groups; g++) total += global_hist[g * 256u + bin];
+    col_total[bin] = total;
+    barrier();
+    memoryBarrierShared();
+
+    // 2. exclusive scan over bins
+    col_scan[0][bin] = total;
+    barrier();
+    memoryBarrierShared();
+    int src = 0;
+    for (uint offset = 1; offset < 256; offset <<= 1) {
+        int dst = src ^ 1;
+        if (bin >= offset) col_scan[dst][bin] = col_scan[src][bin] + col_scan[src][bin - offset];
+        else col_scan[dst][bin] = col_scan[src][bin];
+        barrier();
+        memoryBarrierShared();
+        src = dst;
+    }
+    uint excl = (bin == 0) ? 0u : col_scan[src][bin - 1];
+    scanned[bin] = excl;
+
+    // 3. per-WG exclusive scan over g for this bin, rewrite global_hist in place.
+    //    Keep a copy of this bin's counts (already read col per g? we need per-g
+    //    values again) — re-read from global_hist while rewriting carefully:
+    //    we rewrite g ascending, accumulating running = excl + sum_{g'<g}.
+    uint running = excl;
+    for (uint g = 0; g < pc.groups; g++) {
+        uint idx = g * 256u + bin;
+        uint c = global_hist[idx];
+        global_hist[idx] = running;
+        running += c;
+    }
+}

@@ -1,0 +1,32 @@
+// grid_cell_indices - Spatial hash grid construction, stage 1.
+// Computes cell indices for particles based on spatial position:
+// point_cells[i] = cell(particle i), point_ids[i] = i.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ParticleX { vec4 px_arr[]; };
+layout(std430, binding = 1) writeonly buffer PointCells { uint point_cells[]; };
+layout(std430, binding = 2) writeonly buffer PointIds { uint point_ids[]; };
+
+layout(push_constant) uniform PC {
+    float cell_width_inv;
+    float pad0, pad1, pad2;
+} pc;
+
+uint hash_grid_index(vec3 p) {
+    // Compute grid cell index with origin offset:
+    ivec3 g = ivec3(floor(p * pc.cell_width_inv));
+    g = g + (1 << 20);
+    g = max(g, ivec3(0)); // clamp (guard region)
+    ivec3 d = ivec3(128, 128, 128);
+    ivec3 c = g % d;
+    return uint(c.z * (d.x * d.y) + c.y * d.x + c.x);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= px_arr.length()) return;
+    point_cells[tid] = hash_grid_index(px_arr[tid].xyz);
+    point_ids[tid] = tid;
+}

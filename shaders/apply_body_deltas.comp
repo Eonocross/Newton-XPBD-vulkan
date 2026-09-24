@@ -1,0 +1,117 @@
+// apply_body_deltas - Applies positional and rotational deltas to rigid bodies.
+//
+// Physics update:
+//   dp = spatial_top(delta) * (inv_m * weight)
+//   dq = spatial_bottom(delta) * weight
+//   wb = rotate_inv(q0, w0)
+//   dwb = inv_I * rotate_inv(q0, dq)
+//   tb = cross(dwb, I*(wb+dwb)) + cross(wb, I*dwb)  [Coriolis correction]
+//   dw1 = rotate(q0, dwb - dt * inv_I * tb)
+//   q1 = normalize(q0 + 0.5 * quat(dw1*dt, 0) * q0)
+//   x_com = p0 + rotate(q0, com)
+//   p1 = x_com + dp*dt;  p1 -= rotate(q1, com)
+//   v1 = v0 + dp;  w1 = w0 + dw1
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer BodyQ { vec4 body_q[]; };      // 2 vec4/body in
+layout(std430, binding = 1) readonly buffer BodyQd { vec4 body_qd[]; };
+layout(std430, binding = 2) readonly buffer BodyCom { float body_com[]; }; // 3 floats/body
+layout(std430, binding = 3) readonly buffer BodyI { float body_inertia[]; };   // 9 floats/body
+layout(std430, binding = 4) readonly buffer BodyInvM { float body_inv_m[]; };
+layout(std430, binding = 5) readonly buffer BodyInvI { float body_inv_i[]; };  // 9 floats/body
+layout(std430, binding = 6) readonly buffer Deltas { float deltas[]; };        // 6 floats/body (atomic output of contact kernel)
+layout(std430, binding = 7) readonly buffer ConWeights { float constraint_inv_weights[]; }; // 1/body (may be all-zero)
+
+layout(std430, binding = 8) writeonly buffer BodyQNew { vec4 body_q_new[]; };
+layout(std430, binding = 9) writeonly buffer BodyQdNew { vec4 body_qd_new[]; };
+
+layout(push_constant) uniform PC {
+    float dt;
+    int use_constraint_weights;
+    int _pad0;
+    int _pad1;
+} pc;
+
+vec3 quat_rotate_v(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + v * q.w);
+}
+
+vec3 quat_rotate_inv_v(vec4 q, vec3 v) {
+    return quat_rotate_v(vec4(-q.xyz, q.w), v);
+}
+
+vec4 quat_mul_v(vec4 p, vec4 q) {
+    float w = p.w * q.w - dot(p.xyz, q.xyz);
+    vec3 xyz = p.w * q.xyz + q.w * p.xyz + cross(p.xyz, q.xyz);
+    return vec4(xyz, w);
+}
+
+vec3 mat_mul_f(float m[9], vec3 v) {
+    return vec3(m[0], m[1], m[2]) * v.x + vec3(m[3], m[4], m[5]) * v.y + vec3(m[6], m[7], m[8]) * v.z;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(body_inv_m.length())) return;
+    int b = int(tid);
+
+    float inv_m = body_inv_m[b];
+    if (inv_m == 0.0) {
+        body_q_new[b * 2 + 0] = body_q[b * 2 + 0];
+        body_q_new[b * 2 + 1] = body_q[b * 2 + 1];
+        body_qd_new[b * 2 + 0] = body_qd[b * 2 + 0];
+        body_qd_new[b * 2 + 1] = body_qd[b * 2 + 1];
+        return;
+    }
+
+    vec4 pos0 = body_q[b * 2 + 0];
+    vec4 quat0 = body_q[b * 2 + 1];
+    vec3 v0 = body_qd[b * 2 + 0].xyz;
+    vec3 w0 = body_qd[b * 2 + 1].xyz;
+
+    float I9[9]; float Iinv9[9];
+    for (int k = 0; k < 9; k++) {
+        I9[k] = body_inertia[b * 9 + k];
+        Iinv9[k] = body_inv_i[b * 9 + k];
+    }
+    vec3 com = vec3(body_com[b * 3 + 0], body_com[b * 3 + 1], body_com[b * 3 + 2]);
+
+    // delta: [lin(3), ang(3)] velocity-like
+    vec3 dp = vec3(deltas[b * 6 + 0], deltas[b * 6 + 1], deltas[b * 6 + 2]);
+    vec3 dq = vec3(deltas[b * 6 + 3], deltas[b * 6 + 4], deltas[b * 6 + 5]);
+
+    float weight = 1.0;
+    if (pc.use_constraint_weights != 0) {
+        float inv_weight = constraint_inv_weights[b];
+        if (inv_weight > 0.0) weight = 1.0 / inv_weight;
+    }
+
+    dp = dp * (inv_m * weight);
+    vec3 dq_w = dq * weight;
+
+    vec3 wb = quat_rotate_inv_v(quat0, w0);
+    vec3 dwb = mat_mul_f(Iinv9, quat_rotate_inv_v(quat0, dq_w));
+    // Coriolis correction from dwb = (wb+dwb) I (wb+dwb) - wb I wb  (expanded)
+    vec3 tb = cross(dwb, mat_mul_f(I9, wb + dwb)) + cross(wb, mat_mul_f(I9, dwb));
+    vec3 dw1 = quat_rotate_v(quat0, dwb - pc.dt * mat_mul_f(Iinv9, tb));
+
+    vec4 quat1 = normalize(quat0 + quat_mul_v(vec4(dw1 * pc.dt, 0.0), quat0) * 0.5);
+
+    vec3 x_com = pos0.xyz + quat_rotate_v(quat0, com);
+    vec3 p1 = x_com + dp * pc.dt;
+    p1 -= quat_rotate_v(quat1, com);
+
+    vec3 v1 = v0 + dp;
+    vec3 w1 = w0 + dw1;
+
+    if (length(v1) < 1e-4) v1 = vec3(0.0);
+    if (length(w1) < 1e-4) w1 = vec3(0.0);
+
+    body_q_new[b * 2 + 0] = vec4(p1, 0.0);
+    body_q_new[b * 2 + 1] = quat1;
+    body_qd_new[b * 2 + 0] = vec4(v1, 0.0);
+    body_qd_new[b * 2 + 1] = vec4(w1, 0.0);
+}

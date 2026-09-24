@@ -1,0 +1,402 @@
+// bench mesh-contact generator: 9-cube scene. Same narrowphase as
+// Generates narrowphase contacts between particles and mesh colliders, with mesh
+// contacts to the shared contact SoA AFTER the plane pass runs, with shape
+// ids 1..9 (plane = 0). Runs as a second dispatch in the collide phase.
+// One thread per particle per... one thread per particle; queries all 9
+// cube BVHs stacked in one node buffer (each cube's subtree reached via its
+// own root; roots in push constants / params buffer).
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Q { vec4 q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Radii { float radii[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PFlags { int pflags[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Vtx { float points[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Idx { uint tri_idx[]; };
+layout(std430, set = 0, binding = 5) readonly buffer NodeLower { float nl_xyzw[]; };
+layout(std430, set = 0, binding = 6) readonly buffer NodeUpper { float nu_xyzw[]; };
+layout(std430, set = 0, binding = 7) readonly buffer BvhMeta { uint bvh_meta[]; }; // [0]=n_nodes, [1]=leaf_size, [2..11]=9 cube roots, [12]=avg_edge_bits
+layout(std430, set = 0, binding = 8) readonly buffer PrimIdx { uint prim[]; };
+layout(std430, set = 0, binding = 9) buffer OutCount { int out_count[]; };
+layout(std430, set = 0, binding = 10) buffer OutParticle { int out_particle[]; };
+layout(std430, set = 0, binding = 11) buffer OutShape { int out_shape[]; };
+layout(std430, set = 0, binding = 12) buffer OutBodyPos { float out_body_pos[]; };
+layout(std430, set = 0, binding = 13) buffer OutBodyVel { float out_body_vel[]; };
+layout(std430, set = 0, binding = 14) buffer OutNormal { float out_normal[]; };
+layout(std430, set = 0, binding = 15) readonly buffer Params { uint params[]; }; // [0]=n, [1]=contact_max, [2]=margin_bits
+layout(std430, set = 0, binding = 17) readonly buffer MeshVel { float mesh_vel[]; };
+
+const float PI = 3.14159265359f;
+
+uint unpack_index(uint packed) { return packed & 0x3FFFFFFFu; }
+uint unpack_leaf_flag(uint packed) { return (packed >> 30u) & 0x3u; }
+
+float dist_sq_aabb(vec3 p, vec3 lo, vec3 hi) {
+    vec3 d = max(max(lo - p, vec3(0.0)), p - hi);
+    return dot(d, d);
+}
+
+float exact_sqrt(float a) {
+    float d = sqrt(a);
+    float r = fma(-d, d, a);
+    return fma(r, 0.5 / d, d);
+}
+
+float exact_length(vec3 a) {
+    float yy = a.y * a.y;
+    float xx_yy = fma(a.x, a.x, yy);
+    float sq = fma(a.z, a.z, xx_yy);
+    return exact_sqrt(sq);
+}
+
+vec3 exact_div(vec3 v, float d) {
+    float inv_d = 1.0 / d;
+    vec3 q = v * inv_d;
+    vec3 rem = fma(vec3(-d), q, v);
+    return fma(rem, vec3(inv_d), q);
+}
+
+float exact_div1(float v, float d) {
+    float inv_d = 1.0 / d;
+    float q = v * inv_d;
+    float rem = fma(-d, q, v);
+    return fma(rem, inv_d, q);
+}
+
+precise float exact_dot3(vec3 u, vec3 v) {
+    precise float py = u.y * v.y;
+    precise float pxy = fma(u.x, v.x, py);
+    return fma(u.z, v.z, pxy);
+}
+
+float diff_product(float a, float b, float c, float d) {
+    float cd = c * d;
+    float diff = fma(a, b, -cd);
+    float err = fma(-c, d, cd);
+    return diff + err;
+}
+
+bool intersect_ray_tri_woop(vec3 p, vec3 dir, vec3 a, vec3 b, vec3 c) {
+    vec3 adir = abs(dir);
+    int kz = 0;
+    if (adir.y > adir.x) kz = 1;
+    if (adir.z > (kz == 1 ? adir.y : adir.x)) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (dir[kz] < 0.0) {
+        int tmp = kx; kx = ky; ky = tmp;
+    }
+    float Sx = dir[kx] / dir[kz];
+    float Sy = dir[ky] / dir[kz];
+    float Sz = 1.0 / dir[kz];
+    vec3 A = a - p;
+    vec3 B = b - p;
+    vec3 C = c - p;
+    float Ax = A[kx] - Sx * A[kz];
+    float Ay = A[ky] - Sy * A[kz];
+    float Bx = B[kx] - Sx * B[kz];
+    float By = B[ky] - Sy * B[kz];
+    float Cx = C[kx] - Sx * C[kz];
+    float Cy = C[ky] - Sy * C[kz];
+    float U = diff_product(Cx, By, Cy, Bx);
+    float V = diff_product(Ax, Cy, Ay, Cx);
+    float W = diff_product(Bx, Ay, By, Ax);
+    if ((U < 0.0 || V < 0.0 || W < 0.0) && (U > 0.0 || V > 0.0 || W > 0.0)) return false;
+    float det = U + V + W;
+    if (det == 0.0) return false;
+    float Az = Sz * A[kz];
+    float Bz = Sz * B[kz];
+    float Cz = Sz * C[kz];
+    float T = U * Az + V * Bz + W * Cz;
+    if ((T < 0.0 && det > 0.0) || (T > 0.0 && det < 0.0)) return false;
+    return true;
+}
+
+void closest_point_triangle(vec3 p, vec3 a, vec3 b, vec3 c, out vec3 cp, out vec3 tri_normal, out vec3 bary) {
+    vec3 ab = b - a, ac = c - a, ap = p - a;
+    tri_normal = normalize(cross(ab, ac));
+
+    float u, v, w;
+    float d1 = exact_dot3(ab, ap), d2 = exact_dot3(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) {
+        v = 0.0;
+        u = 1.0;
+    } else {
+        vec3 bp = p - b;
+        float d3 = exact_dot3(ab, bp), d4 = exact_dot3(ac, bp);
+        if (d3 >= 0.0 && d4 <= d3) {
+            v = 1.0;
+            u = 0.0;
+        } else {
+            precise float vc = fma(d1, d4, -(d2 * d3)); // Precise FMA for vc = d1*d4 - d2*d3
+            if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+                v = exact_div1(d1, d1 - d3);
+                u = 1.0 - v;
+            } else {
+                vec3 cp_p = p - c;
+                float d5 = exact_dot3(ab, cp_p), d6 = exact_dot3(ac, cp_p);
+                if (d6 >= 0.0 && d5 <= d6) {
+                    v = 0.0;
+                    u = 0.0;
+                } else {
+                    precise float vb = fma(d5, d2, -(d1 * d6));
+                    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+                        float w_val = exact_div1(d2, d2 - d6);
+                        v = 0.0;
+                        u = 1.0 - w_val;
+                    } else {
+                        precise float va = fma(d3, d6, -(d5 * d4)); // Precise FMA for va = d3*d6 - d5*d4
+                        if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+                            float w_val = exact_div1(d4 - d3, (d4 - d3) + (d5 - d6));
+                            v = 1.0 - w_val;
+                            u = (1.0 - v) - w_val;
+                        } else {
+                            precise float sum_vavb = va + vb;
+                            precise float sum_all = vc + sum_vavb; // Addition order: add(va+vb), then add vc
+                            precise float r0 = 1.0 / sum_all;
+                            precise float rem = fma(-sum_all, r0, 1.0);
+                            precise float denom = fma(rem, r0, r0); // Exact IEEE-754 rcp.rn.f32 via Newton-Raphson refinement
+                            v = vb * denom;
+                            u = fma(-vc, denom, 1.0 - v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Closest-point barycentric reconstruction:
+    // float u = barycentric[0]; float v = barycentric[1];
+    // float w = 1.f - u - v;
+    // vec3 c = u * p + v * q + w * r;
+    precise float u_out = u;
+    precise float v_out = v;
+    precise float w_sub1 = 1.0 - u_out;
+    precise float w_out = w_sub1 - v_out;
+    bary = vec3(u_out, v_out, w_out);
+    cp = u_out * a + v_out * b + w_out * c;
+}
+
+void main() {
+    uint n_particles = params[0];
+    uint contact_max = params[1];
+    float margin = uintBitsToFloat(params[2]);
+    uint num_meshes = params[3];
+    uint n_nodes = bvh_meta[0];
+    uint leaf_size = bvh_meta[1];
+    float avg_edge = uintBitsToFloat(bvh_meta[2]);
+    float epsilon_min_dist = avg_edge * 1e-3;
+    float eps2 = epsilon_min_dist * epsilon_min_dist;
+
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= n_particles) return;
+    if ((pflags[tid] & 1) == 0) return;
+
+    vec3 p = q[tid].xyz;
+    float radius = radii[tid];
+
+    // query each mesh BVH independently and emit a contact for each qualifying mesh
+    for (uint ci = 0u; ci < num_meshes; ci++) {
+        float mesh_shape_margin = uintBitsToFloat(params[4 + ci]);
+        float max_dist = margin + mesh_shape_margin + radius;
+        uint root = bvh_meta[3 + ci];
+        uint stack[32];
+        uint sp = 0;
+        stack[sp++] = root;
+        float min_dist = max_dist;
+        vec3 min_cp = vec3(0.0);
+        vec3 acc_normal = vec3(0.0);
+        uint min_face = 0u;
+        vec2 saved_vw = vec2(0.0);
+        vec3 saved_bary = vec3(0.0);
+        bool found = false;
+
+        bool is_watertight = (ci == 1u);
+        float min_dist_sq = max_dist * max_dist;
+
+        while (sp > 0) {
+            uint ni = stack[--sp];
+            vec3 lo = vec3(nl_xyzw[ni*4+0], nl_xyzw[ni*4+1], nl_xyzw[ni*4+2]);
+            vec3 hi = vec3(nu_xyzw[ni*4+0], nu_xyzw[ni*4+1], nu_xyzw[ni*4+2]);
+            float nds = dist_sq_aabb(p, lo, hi);
+            if (is_watertight) {
+                if (nds > min_dist_sq) continue;
+            } else {
+                if (nds > (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist)) continue;
+            }
+
+            uint lower_packed = floatBitsToUint(nl_xyzw[ni*4+3]);
+            uint left_i = unpack_index(lower_packed);
+            uint is_leaf = unpack_leaf_flag(lower_packed);
+            uint right_i = unpack_index(floatBitsToUint(nu_xyzw[ni*4+3]));
+
+            if (is_leaf != 0u) {
+                for (uint pc = left_i; pc < right_i; pc++) {
+                    uint t = prim[pc];
+                    vec3 a = vec3(points[tri_idx[t*3+0]*3+0], points[tri_idx[t*3+0]*3+1], points[tri_idx[t*3+0]*3+2]);
+                    vec3 b = vec3(points[tri_idx[t*3+1]*3+0], points[tri_idx[t*3+1]*3+1], points[tri_idx[t*3+1]*3+2]);
+                    vec3 c = vec3(points[tri_idx[t*3+2]*3+0], points[tri_idx[t*3+2]*3+1], points[tri_idx[t*3+2]*3+2]);
+                    vec3 cp; vec3 tn; vec3 tri_bary;
+                    closest_point_triangle(p, a, b, c, cp, tn, tri_bary);
+
+                    if (is_watertight) {
+                        vec3 diff = cp - p;
+                        float dist_sq = dot(diff, diff);
+                        if (dist_sq < min_dist_sq) {
+                            min_dist_sq = dist_sq;
+                            min_face = t;
+                            saved_vw = vec2(tri_bary.y, tri_bary.z);
+                            saved_bary = tri_bary;
+                            found = true;
+                        }
+                    } else {
+                        float dist = exact_length(cp - p);
+                        if (dist < min_dist + epsilon_min_dist) {
+                            vec3 e0 = b - a, e1 = c - a, e2 = c - b;
+                            float weight;
+                            vec3 cpv = cp - a, cqv = cp - b, crv = cp - c;
+                            float lcp = dot(cpv, cpv), lcq = dot(cqv, cqv), lcr = dot(crv, crv);
+                            float e0n2 = dot(e0, e0), e1n2 = dot(e1, e1), e2n2 = dot(e2, e2);
+                            if (lcp < eps2)          weight = acos(dot(normalize(e0), normalize(e1)));
+                            else if (lcq < eps2)     weight = acos(dot(normalize(e2), normalize(-e0)));
+                            else if (lcr < eps2)     weight = acos(dot(normalize(-e1), normalize(-e2)));
+                            else {
+                                float e0cp = dot(e0, cpv), e2cq = dot(e2, cqv), e1cp = dot(e1, cpv);
+                                if ((lcp*e0n2 - e0cp*e0cp < eps2*e0n2) ||
+                                    (lcq*e2n2 - e2cq*e2cq < eps2*e2n2) ||
+                                    (lcp*e1n2 - e1cp*e1cp < eps2*e1n2)) weight = PI;
+                                else weight = 2.0 * PI;
+                            }
+                            if (dist > min_dist - epsilon_min_dist) {
+                                acc_normal += weight * tn;
+                                if (dist < min_dist) {
+                                    min_dist = dist;
+                                    min_face = t;
+                                    saved_vw = vec2(tri_bary.y, tri_bary.z);
+                                    saved_bary = tri_bary;
+                                }
+                            } else {
+                                min_dist = dist;
+                                min_face = t;
+                                saved_vw = vec2(tri_bary.y, tri_bary.z);
+                                saved_bary = tri_bary;
+                                acc_normal = weight * tn;
+                            }
+                            found = true;
+                        }
+                    }
+                }
+            } else {
+                vec3 llo = vec3(nl_xyzw[left_i*4+0], nl_xyzw[left_i*4+1], nl_xyzw[left_i*4+2]);
+                vec3 lhi = vec3(nu_xyzw[left_i*4+0], nu_xyzw[left_i*4+1], nu_xyzw[left_i*4+2]);
+                vec3 rlo = vec3(nl_xyzw[right_i*4+0], nl_xyzw[right_i*4+1], nl_xyzw[right_i*4+2]);
+                vec3 rhi = vec3(nu_xyzw[right_i*4+0], nu_xyzw[right_i*4+1], nu_xyzw[right_i*4+2]);
+                float lds = dist_sq_aabb(p, llo, lhi);
+                float rds = dist_sq_aabb(p, rlo, rhi);
+                float thresh = is_watertight ? min_dist_sq : ((min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist));
+                if (lds < rds) {
+                    if (rds < thresh) stack[sp++] = right_i;
+                    if (lds < thresh) stack[sp++] = left_i;
+                } else {
+                    if (lds < thresh) stack[sp++] = left_i;
+                    if (rds < thresh) stack[sp++] = right_i;
+                }
+            }
+        }
+
+        if (is_watertight) {
+            min_dist = exact_sqrt(min_dist_sq);
+        }
+
+        // If this mesh produces a qualifying contact, emit it
+        if (found && min_dist < max_dist) {
+            // Compute barycentric coordinates:
+            //   min_v = v; min_w = w;
+            //   u = 1.0f - min_v - min_w;
+            //   v = min_v;
+            float min_v = saved_vw.x;
+            float min_w = saved_vw.y;
+            precise float u_mesh = (1.0 - min_v) - min_w;
+            precise float v_mesh = min_v;
+            
+            // Load vertices from mesh index buffer:
+            vec3 v0 = vec3(points[tri_idx[min_face*3+0]*3+0], points[tri_idx[min_face*3+0]*3+1], points[tri_idx[min_face*3+0]*3+2]);
+            vec3 v1 = vec3(points[tri_idx[min_face*3+1]*3+0], points[tri_idx[min_face*3+1]*3+1], points[tri_idx[min_face*3+1]*3+2]);
+            vec3 v2 = vec3(points[tri_idx[min_face*3+2]*3+0], points[tri_idx[min_face*3+2]*3+1], points[tri_idx[min_face*3+2]*3+2]);
+
+            // Evaluate triangle vertex positions with barycentric coordinates:
+            // mul.f32 %f32, b.x, v; fma.rn.f32 %f37, a.x, u, %f32;
+            // sub.f32 %f41, 1.0, u; sub.f32 %f42, %f41, v;
+            // fma.rn.f32 %f52, %f42, c.x, %f37;
+            precise float w_eval = (1.0 - u_mesh) - v_mesh;
+            precise vec3 term_b = v1 * v_mesh;
+            precise vec3 term_ab = fma(v0, vec3(u_mesh), term_b);
+            precise vec3 shape_p = fma(v2, vec3(w_eval), term_ab);
+
+            // Interpolate triangle surface velocity with barycentric coordinates:
+            // vp * u + vq * v + vr * (1.0f - u - v)
+            uint idx0 = tri_idx[min_face*3+0];
+            uint idx1 = tri_idx[min_face*3+1];
+            uint idx2 = tri_idx[min_face*3+2];
+            vec3 vel0 = vec3(mesh_vel[idx0*3+0], mesh_vel[idx0*3+1], mesh_vel[idx0*3+2]);
+            vec3 vel1 = vec3(mesh_vel[idx1*3+0], mesh_vel[idx1*3+1], mesh_vel[idx1*3+2]);
+            vec3 vel2 = vec3(mesh_vel[idx2*3+0], mesh_vel[idx2*3+1], mesh_vel[idx2*3+2]);
+            precise vec3 vel_term_b = vel1 * v_mesh;
+            precise vec3 vel_term_ab = fma(vel0, vec3(u_mesh), vel_term_b);
+            precise vec3 shape_v = fma(vel2, vec3(w_eval), vel_term_ab);
+            
+            float sign;
+            if (is_watertight) {
+                // Ray parity check for inside/outside determination:
+                // Deterministic ray direction from rand_init(42):
+                vec3 ray_dir = vec3(1.029700994, 1.086472273, 1.034694910);
+                uint hit_count = 0u;
+                for (uint ti = 0u; ti < 12u; ti++) {
+                    uint t = prim[2u + ti];
+                    vec3 ta = vec3(points[tri_idx[t*3+0]*3+0], points[tri_idx[t*3+0]*3+1], points[tri_idx[t*3+0]*3+2]);
+                    vec3 tb = vec3(points[tri_idx[t*3+1]*3+0], points[tri_idx[t*3+1]*3+1], points[tri_idx[t*3+1]*3+2]);
+                    vec3 tc = vec3(points[tri_idx[t*3+2]*3+0], points[tri_idx[t*3+2]*3+1], points[tri_idx[t*3+2]*3+2]);
+                    if (intersect_ray_tri_woop(p, ray_dir, ta, tb, tc)) {
+                        hit_count++;
+                    }
+                }
+                sign = ((hit_count & 1u) != 0u) ? -1.0 : 1.0;
+            } else {
+                sign = dot(acc_normal, p - shape_p) > 0.0 ? 1.0 : -1.0;
+            }
+
+            vec3 delta = p - shape_p;
+            float delta_len = exact_length(delta);
+            vec3 nrm;
+            if (delta_len > 1e-7) {
+                nrm = exact_div(delta, delta_len) * sign;
+            } else {
+                float acc_len = exact_length(acc_normal);
+                if (acc_len > 1e-7) {
+                    nrm = exact_div(acc_normal, acc_len) * sign;
+                } else {
+                    nrm = vec3(0.0, 0.0, 1.0);
+                }
+            }
+            float d = delta_len * sign;
+            vec3 body_pos = fma(-vec3(d), nrm, p);
+            uint index = uint(atomicAdd(out_count[0], 1));
+            if (index < contact_max) {
+                out_particle[index] = int(tid);
+                out_shape[index] = int(ci) + 1;
+                out_body_pos[index*3+0] = body_pos.x;
+                out_body_pos[index*3+1] = body_pos.y;
+                out_body_pos[index*3+2] = body_pos.z;
+                out_body_vel[index*3+0] = shape_v.x;
+                out_body_vel[index*3+1] = shape_v.y;
+                out_body_vel[index*3+2] = shape_v.z;
+                out_normal[index*3+0] = nrm.x;
+                out_normal[index*3+1] = nrm.y;
+                out_normal[index*3+2] = nrm.z;
+            }
+        }
+    }
+}

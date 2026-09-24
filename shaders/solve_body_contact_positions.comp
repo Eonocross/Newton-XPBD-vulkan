@@ -1,0 +1,277 @@
+// solve_body_contact_positions - Resolves rigid body contact constraints.
+// Accumulates positional and rotational deltas via atomic additions.
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer BodyQ { vec4 body_q[]; };       // 2 vec4/body
+layout(std430, binding = 1) readonly buffer BodyQd { vec4 body_qd[]; };     // 2 vec4/body
+layout(std430, binding = 2) readonly buffer BodyFlags { int body_flags[]; };
+layout(std430, binding = 3) readonly buffer BodyCom { float body_com[]; };  // 3 floats/body (tight)
+layout(std430, binding = 4) readonly buffer BodyMInv { float body_m_inv[]; };
+layout(std430, binding = 5) readonly buffer BodyIInv { float body_i_inv[]; }; // 9 floats/body
+layout(std430, binding = 6) readonly buffer ShapeBody { int shape_body[]; };
+layout(std430, binding = 7) readonly buffer ContactCount { int contact_count[]; }; // [1]
+layout(std430, binding = 8) readonly buffer CP0 { float c_point0[]; };      // 3 floats/contact
+layout(std430, binding = 9) readonly buffer CP1 { float c_point1[]; };
+layout(std430, binding = 10) readonly buffer CO0 { float c_offset0[]; };
+layout(std430, binding = 11) readonly buffer CO1 { float c_offset1[]; };
+layout(std430, binding = 12) readonly buffer CN { float c_normal[]; };
+layout(std430, binding = 13) readonly buffer CT0 { float c_thickness0[]; };
+layout(std430, binding = 14) readonly buffer CT1 { float c_thickness1[]; };
+layout(std430, binding = 15) readonly buffer CS0 { int c_shape0[]; };
+layout(std430, binding = 16) readonly buffer CS1 { int c_shape1[]; };
+layout(std430, binding = 17) readonly buffer MatMu { float mat_mu[]; };
+layout(std430, binding = 18) readonly buffer MatMuT { float mat_mu_torsional[]; };
+layout(std430, binding = 19) readonly buffer MatMuR { float mat_mu_rolling[]; };
+
+// outputs (atomic)
+layout(std430, binding = 20) buffer Deltas { float deltas[]; };             // 6 floats/body: lin(3), ang(3)
+layout(std430, binding = 21) buffer ContactInvWeight { float contact_inv_weight[]; }; // 1/body
+layout(std430, binding = 22) buffer ContactImpulse { float contact_impulse[]; };      // 6 floats/contact
+
+layout(push_constant) uniform PC {
+    float relaxation;
+    float dt;
+    int contact_max;
+    int _pad;
+} pc;
+
+const int KINEMATIC = 2; // BodyFlags.KINEMATIC
+
+// --- Helpers ---
+
+vec3 tf_point(vec4 pos, vec4 quat, vec3 p) {
+    // Transform point: rotate then translate
+    vec3 q = quat.xyz;
+    return p + 2.0 * cross(q, cross(q, p) + p * quat.w) + pos.xyz;
+}
+
+vec3 quat_rotate_inv_v(vec4 quat, vec3 v) {
+    vec3 nq = -quat.xyz;
+    return v + 2.0 * cross(nq, cross(nq, v) + v * quat.w);
+}
+
+float length_sq(vec3 v) { return dot(v, v); }
+
+// mat33 (tight 9 floats, column-major) * vec3
+vec3 mat_mul_f(float m[9], vec3 v) {
+    return vec3(m[0], m[1], m[2]) * v.x + vec3(m[3], m[4], m[5]) * v.y + vec3(m[6], m[7], m[8]) * v.z;
+}
+
+float dot_m(float m[9], vec3 a) { return dot(mat_mul_f(m, a), a); }
+
+// compute_contact_constraint_delta (kernels.py:2025)
+float compute_contact_constraint_delta(
+    float err, vec4 qa, vec4 qb, float m_inv_a, float m_inv_b,
+    float i_inv_a[9], float i_inv_b[9],
+    vec3 linear_a, vec3 linear_b, vec3 angular_a, vec3 angular_b,
+    float relaxation, float dt) {
+    float denom = 0.0;
+    denom += length_sq(linear_a) * m_inv_a;
+    denom += length_sq(linear_b) * m_inv_b;
+
+    vec3 rot_angular_a = quat_rotate_inv_v(qa, angular_a);
+    vec3 rot_angular_b = quat_rotate_inv_v(qb, angular_b);
+
+    denom += dot(rot_angular_a, mat_mul_f(i_inv_a, rot_angular_a));
+    denom += dot(rot_angular_b, mat_mul_f(i_inv_b, rot_angular_b));
+
+    float delta_lambda = -err;
+    if (denom > 0.0) delta_lambda /= dt * denom;
+    return delta_lambda * relaxation;
+}
+
+void atomic_add_deltas(int body, vec3 lin, vec3 ang) {
+    int base = body * 6;
+    atomicAdd(deltas[base + 0], lin.x);
+    atomicAdd(deltas[base + 1], lin.y);
+    atomicAdd(deltas[base + 2], lin.z);
+    atomicAdd(deltas[base + 3], ang.x);
+    atomicAdd(deltas[base + 4], ang.y);
+    atomicAdd(deltas[base + 5], ang.z);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(pc.contact_max)) return;
+    if (tid >= uint(contact_count[0])) return;
+
+    int ci = int(tid);
+
+    int shape_a = c_shape0[ci];
+    int shape_b = c_shape1[ci];
+    if (shape_a == shape_b) return;
+    int body_a = -1;
+    if (shape_a >= 0) body_a = shape_body[shape_a];
+    int body_b = -1;
+    if (shape_b >= 0) body_b = shape_body[shape_b];
+    if (body_a == body_b) return;
+
+    vec4 pos_a = vec4(0.0); vec4 quat_a = vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 pos_b = vec4(0.0); vec4 quat_b = vec4(0.0, 0.0, 0.0, 1.0);
+    if (body_a >= 0) { pos_a = body_q[body_a * 2 + 0]; quat_a = body_q[body_a * 2 + 1]; }
+    if (body_b >= 0) { pos_b = body_q[body_b * 2 + 0]; quat_b = body_q[body_b * 2 + 1]; }
+
+    vec3 p0 = vec3(c_point0[ci * 3 + 0], c_point0[ci * 3 + 1], c_point0[ci * 3 + 2]);
+    vec3 p1 = vec3(c_point1[ci * 3 + 0], c_point1[ci * 3 + 1], c_point1[ci * 3 + 2]);
+
+    vec3 bx_a = tf_point(pos_a, quat_a, p0);
+    vec3 bx_b = tf_point(pos_b, quat_b, p1);
+
+    vec3 n = vec3(c_normal[ci * 3 + 0], c_normal[ci * 3 + 1], c_normal[ci * 3 + 2]);
+    // contact_surface_separation
+    float d = dot(n, bx_b - bx_a) - (c_thickness0[ci] + c_thickness1[ci]);
+    if (d >= 0.0) return;
+
+    float m_inv_a = 0.0, m_inv_b = 0.0;
+    float I_inv_a[9]; float I_inv_b[9];
+    for (int k = 0; k < 9; k++) { I_inv_a[k] = 0.0; I_inv_b[k] = 0.0; }
+    vec3 com_a = vec3(0.0), com_b = vec3(0.0);
+    vec3 omega_a = vec3(0.0), omega_b = vec3(0.0);
+    vec3 offset_a = vec3(c_offset0[ci * 3 + 0], c_offset0[ci * 3 + 1], c_offset0[ci * 3 + 2]);
+    vec3 offset_b = vec3(c_offset1[ci * 3 + 0], c_offset1[ci * 3 + 1], c_offset1[ci * 3 + 2]);
+
+    if (body_a >= 0) {
+        m_inv_a = body_m_inv[body_a];
+        for (int k = 0; k < 9; k++) I_inv_a[k] = body_i_inv[body_a * 9 + k];
+        com_a = vec3(body_com[body_a * 3 + 0], body_com[body_a * 3 + 1], body_com[body_a * 3 + 2]);
+        omega_a = body_qd[body_a * 2 + 1].xyz;
+    }
+    if (body_b >= 0) {
+        m_inv_b = body_m_inv[body_b];
+        for (int k = 0; k < 9; k++) I_inv_b[k] = body_i_inv[body_b * 9 + k];
+        com_b = vec3(body_com[body_b * 3 + 0], body_com[body_b * 3 + 1], body_com[body_b * 3 + 2]);
+        omega_b = body_qd[body_b * 2 + 1].xyz;
+    }
+
+    // average material properties
+    int mat_nonzero = 0;
+    float mu = 0.0, mu_torsional = 0.0, mu_rolling = 0.0;
+    if (shape_a >= 0) {
+        mat_nonzero += 1;
+        mu += mat_mu[shape_a];
+        mu_torsional += mat_mu_torsional[shape_a];
+        mu_rolling += mat_mu_rolling[shape_a];
+    }
+    if (shape_b >= 0) {
+        mat_nonzero += 1;
+        mu += mat_mu[shape_b];
+        mu_torsional += mat_mu_torsional[shape_b];
+        mu_rolling += mat_mu_rolling[shape_b];
+    }
+    if (mat_nonzero > 0) {
+        mu /= float(mat_nonzero);
+        mu_torsional /= float(mat_nonzero);
+        mu_rolling /= float(mat_nonzero);
+    }
+
+    vec3 r_a = bx_a - tf_point(pos_a, quat_a, com_a);
+    vec3 r_b = bx_b - tf_point(pos_b, quat_b, com_b);
+
+    vec3 angular_a = -cross(r_a, n);
+    vec3 angular_b = cross(r_b, n);
+
+    if (body_a >= 0) atomicAdd(contact_inv_weight[body_a], 1.0);
+    if (body_b >= 0) atomicAdd(contact_inv_weight[body_b], 1.0);
+
+    float lambda_n = compute_contact_constraint_delta(
+        d, quat_a, quat_b, m_inv_a, m_inv_b, I_inv_a, I_inv_b, -n, n, angular_a, angular_b,
+        pc.relaxation, pc.dt);
+
+    vec3 lin_delta_a = -n * lambda_n;
+    vec3 lin_delta_b = n * lambda_n;
+    vec3 ang_delta_a = angular_a * lambda_n;
+    vec3 ang_delta_b = angular_b * lambda_n;
+
+    // linear friction
+    if (mu > 0.0) {
+        // contact_surface_point: transform_point(X_wb, point_local + offset_local)
+        vec3 sbx_a = tf_point(pos_a, quat_a, p0 + offset_a);
+        vec3 sbx_b = tf_point(pos_b, quat_b, p1 + offset_b);
+
+        vec3 delta = sbx_b - sbx_a;
+        vec3 friction_delta = delta - dot(n, delta) * n;
+
+        vec3 fr_a = sbx_a - tf_point(pos_a, quat_a, com_a);
+        vec3 fr_b = sbx_b - tf_point(pos_b, quat_b, com_b);
+
+        // only prescribed kinematic surface motion (see source comment)
+        vec3 rel_v_kin_t = vec3(0.0);
+        if (body_a >= 0 && (body_flags[body_a] & KINEMATIC) != 0) {
+            // velocity_at_point: v + cross(w, r)
+            vec3 v_a = body_qd[body_a * 2 + 0].xyz + cross(omega_a, fr_a);
+            rel_v_kin_t = rel_v_kin_t - (v_a - dot(n, v_a) * n);
+        }
+        if (body_b >= 0 && (body_flags[body_b] & KINEMATIC) != 0) {
+            vec3 v_b = body_qd[body_b * 2 + 0].xyz + cross(omega_b, fr_b);
+            rel_v_kin_t = rel_v_kin_t + (v_b - dot(n, v_b) * n);
+        }
+        friction_delta += rel_v_kin_t * pc.dt;
+
+        vec3 perp = normalize(friction_delta);
+
+        vec3 angular_a_fr = -cross(fr_a, perp);
+        vec3 angular_b_fr = cross(fr_b, perp);
+
+        float err = length(friction_delta);
+
+        if (err > 0.0) {
+            float lambda_fr = compute_contact_constraint_delta(
+                err, quat_a, quat_b, m_inv_a, m_inv_b, I_inv_a, I_inv_b,
+                -perp, perp, angular_a_fr, angular_b_fr, pc.relaxation, pc.dt);
+
+            lambda_fr = max(lambda_fr, -lambda_n * mu);
+
+            lin_delta_a -= perp * lambda_fr;
+            lin_delta_b += perp * lambda_fr;
+
+            ang_delta_a += angular_a_fr * lambda_fr;
+            ang_delta_b += angular_b_fr * lambda_fr;
+        }
+    }
+
+    vec3 delta_omega = omega_b - omega_a;
+
+    if (mu_torsional > 0.0) {
+        float err = dot(delta_omega, n) * pc.dt;
+        if (abs(err) > 0.0) {
+            float lin_arr[9]; // zero linear args — pass zero vectors instead
+            float lambda_torsion = compute_contact_constraint_delta(
+                err, quat_a, quat_b, m_inv_a, m_inv_b, I_inv_a, I_inv_b,
+                vec3(0.0), vec3(0.0), -n, n, pc.relaxation, pc.dt);
+            lambda_torsion = clamp(lambda_torsion, -lambda_n * mu_torsional, lambda_n * mu_torsional);
+            ang_delta_a -= n * lambda_torsion;
+            ang_delta_b += n * lambda_torsion;
+        }
+    }
+
+    if (mu_rolling > 0.0) {
+        delta_omega -= dot(n, delta_omega) * n;
+        float err = length(delta_omega) * pc.dt;
+        if (err > 0.0) {
+            vec3 roll_n = normalize(delta_omega);
+            float lambda_roll = compute_contact_constraint_delta(
+                err, quat_a, quat_b, m_inv_a, m_inv_b, I_inv_a, I_inv_b,
+                vec3(0.0), vec3(0.0), -roll_n, roll_n, pc.relaxation, pc.dt);
+            lambda_roll = max(lambda_roll, -lambda_n * mu_rolling);
+            ang_delta_a -= roll_n * lambda_roll;
+            ang_delta_b += roll_n * lambda_roll;
+        }
+    }
+
+    if (body_a >= 0) atomic_add_deltas(body_a, lin_delta_a, ang_delta_a);
+    if (body_b >= 0) atomic_add_deltas(body_b, lin_delta_b, ang_delta_b);
+
+    // Store contact impulse
+    {
+        int base = ci * 6;
+        atomicAdd(contact_impulse[base + 0], lin_delta_a.x);
+        atomicAdd(contact_impulse[base + 1], lin_delta_a.y);
+        atomicAdd(contact_impulse[base + 2], lin_delta_a.z);
+        atomicAdd(contact_impulse[base + 3], ang_delta_a.x);
+        atomicAdd(contact_impulse[base + 4], ang_delta_a.y);
+        atomicAdd(contact_impulse[base + 5], ang_delta_a.z);
+    }
+}

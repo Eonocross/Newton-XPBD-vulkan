@@ -1,0 +1,103 @@
+// apply_particle_shape_restitution - Resolves normal velocity restitution for particle-shape contacts.
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ParticleVNew { vec4 v_new_arr[]; };
+layout(std430, binding = 1) readonly buffer ParticleXOld { vec4 x_old_arr[]; };
+layout(std430, binding = 2) readonly buffer ParticleVOld { vec4 v_old_arr[]; };
+layout(std430, binding = 3) readonly buffer ParticleRadius { float particle_radius[]; };
+layout(std430, binding = 4) readonly buffer ParticleFlags { int particle_flags[]; };
+layout(std430, binding = 5) readonly buffer BodyQ { vec4 body_q[]; };
+layout(std430, binding = 6) readonly buffer BodyQPrev { vec4 body_q_prev[]; };
+layout(std430, binding = 7) readonly buffer BodyQd { vec4 body_qd[]; };
+layout(std430, binding = 8) readonly buffer BodyQdPrev { vec4 body_qd_prev[]; };
+layout(std430, binding = 9) readonly buffer BodyCom { float body_com[]; };
+layout(std430, binding = 10) readonly buffer ShapeBody { int shape_body[]; };
+layout(std430, binding = 11) readonly buffer ContactCount { int contact_count[]; };
+layout(std430, binding = 12) readonly buffer ContactParticle { int contact_particle[]; };
+layout(std430, binding = 13) readonly buffer ContactShape { int contact_shape[]; };
+layout(std430, binding = 14) readonly buffer ContactBodyPos { float c_body_pos[]; };
+layout(std430, binding = 15) readonly buffer ContactBodyVel { float c_body_vel[]; };
+layout(std430, binding = 16) readonly buffer ContactNormal { float c_normal[]; };
+layout(std430, binding = 17) buffer ParticleVOut { vec4 v_out_arr[]; };
+
+layout(push_constant) uniform Push {
+    float particle_ka;
+    float restitution;
+    uint contact_max;
+    uint pad0;
+} pc;
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+vec3 velocity_at_point(vec3 body_w, vec3 body_v, vec3 r) {
+    return body_v + cross(body_w, r);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint count = min(pc.contact_max, uint(contact_count[0]));
+    if (tid >= count) return;
+
+    int shape_index = contact_shape[tid];
+    int body_index = shape_body[shape_index];
+    int particle_index = contact_particle[tid];
+
+    if ((particle_flags[particle_index] & 1) == 0) return; // ParticleFlags.ACTIVE
+
+    vec3 v_new = v_new_arr[particle_index].xyz;
+    vec3 px = x_old_arr[particle_index].xyz;
+    vec3 v_old = v_old_arr[particle_index].xyz;
+
+    vec3 X_pos = vec3(0.0);
+    vec4 X_rot = vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 X_pos_prev = vec3(0.0);
+    vec4 X_rot_prev = vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 X_com = vec3(0.0);
+
+    if (body_index >= 0) {
+        X_pos = body_q[body_index * 2 + 0].xyz;
+        X_rot = body_q[body_index * 2 + 1];
+        X_pos_prev = body_q_prev[body_index * 2 + 0].xyz;
+        X_rot_prev = body_q_prev[body_index * 2 + 1];
+        X_com = vec3(body_com[body_index * 3 + 0], body_com[body_index * 3 + 1], body_com[body_index * 3 + 2]);
+    }
+
+    vec3 c_bpos = vec3(c_body_pos[tid * 3 + 0], c_body_pos[tid * 3 + 1], c_body_pos[tid * 3 + 2]);
+    vec3 bx = X_pos + quat_rotate(X_rot, c_bpos);
+
+    vec3 n = vec3(c_normal[tid * 3 + 0], c_normal[tid * 3 + 1], c_normal[tid * 3 + 2]);
+    float c = dot(n, px - bx) - particle_radius[particle_index];
+    if (c > pc.particle_ka) return;
+
+    vec3 bx_prev = X_pos_prev + quat_rotate(X_rot_prev, c_bpos);
+    vec3 r = bx_prev - (X_pos_prev + quat_rotate(X_rot_prev, X_com));
+
+    vec3 c_bvel = vec3(c_body_vel[tid * 3 + 0], c_body_vel[tid * 3 + 1], c_body_vel[tid * 3 + 2]);
+    vec3 bv_contact = quat_rotate(X_rot_prev, c_bvel);
+    vec3 bv_old = bv_contact;
+    vec3 bv_new = bv_contact;
+
+    if (body_index >= 0) {
+        vec3 body_v_old = body_qd_prev[body_index * 2 + 0].xyz;
+        vec3 body_w_old = body_qd_prev[body_index * 2 + 1].xyz;
+        vec3 body_v_new = body_qd[body_index * 2 + 0].xyz;
+        vec3 body_w_new = body_qd[body_index * 2 + 1].xyz;
+        bv_old = velocity_at_point(body_w_old, body_v_old, r) + bv_contact;
+        bv_new = velocity_at_point(body_w_new, body_v_new, r) + bv_contact;
+    }
+
+    float rel_vel_old = dot(n, v_old - bv_old);
+    float rel_vel_new = dot(n, v_new - bv_new);
+
+    if (rel_vel_old < 0.0) {
+        vec3 dv = n * (-rel_vel_new + max(-pc.restitution * rel_vel_old, 0.0));
+        atomicAdd(v_out_arr[particle_index].x, dv.x);
+        atomicAdd(v_out_arr[particle_index].y, dv.y);
+        atomicAdd(v_out_arr[particle_index].z, dv.z);
+    }
+}

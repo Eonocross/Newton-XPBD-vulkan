@@ -1,0 +1,35 @@
+// grid_offsets - Spatial hash grid construction, stage 2.
+// Computes cell starts and cell ends from sorted cell indices.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer PointCells { uint point_cells[]; };
+layout(std430, binding = 1) buffer CellStarts { int cell_starts[]; };
+layout(std430, binding = 2) buffer CellEnds { int cell_ends[]; };
+
+layout(push_constant) uniform PC {
+    int num_points;
+    int pad0, pad1, pad2;
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(pc.num_points)) return;
+
+    int c = int(point_cells[tid]);
+
+    if (tid == 0) {
+        cell_starts[c] = 0;
+    } else {
+        int p = int(point_cells[tid - 1]);
+        if (c != p) {
+            cell_starts[c] = int(tid);
+            cell_ends[p] = int(tid);
+        }
+    }
+
+    if (tid == uint(pc.num_points) - 1) {
+        cell_ends[c] = int(tid) + 1;
+    }
+}

@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+!addons/modules/*.so
 
 # Distribution / packaging
 .Python
@@ -216,3 +217,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CMake build directories & artifacts
+build/
+build_*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Blender files & caches
+*.blend1
+*.blend2
+*.blend@
+newton_cache/
+newton_vk_cache/
+
+# IDE & Editor folders
+.vs/
+.vscode/
+.idea/
+
+# Internal maintenance scripts
+package_releases.py
+

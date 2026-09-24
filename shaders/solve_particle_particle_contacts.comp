@@ -1,0 +1,215 @@
+// solve_particle_particle_contacts - Resolves particle-particle contact constraints.
+// Uses spatial hash grid neighbor search to find and resolve pairwise collisions.
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Hash grid dimensions (128x128x128)
+#define GRID_DIM 128
+#define GRID_ORIGIN (1 << 20)
+
+layout(std430, binding = 0) readonly buffer PointIds { int point_ids[]; };
+layout(std430, binding = 1) readonly buffer CellStarts { int cell_starts[]; };
+layout(std430, binding = 2) readonly buffer CellEnds { int cell_ends[]; };
+layout(std430, binding = 3) readonly buffer ParticleX { vec4 x_arr[]; };   // vec4 slots
+layout(std430, binding = 4) readonly buffer ParticleV { vec4 v_arr[]; };   // vec4 slots
+layout(std430, binding = 5) readonly buffer ParticleInvMass { float invmass[]; };
+layout(std430, binding = 6) readonly buffer ParticleRadius { float radius_arr[]; };
+layout(std430, binding = 7) readonly buffer ParticleFlags { int flags_arr[]; };
+// deltas: 3 floats per particle (tight)
+layout(std430, binding = 8) buffer Deltas { float deltas[]; };
+
+// Diagnostic instrumentation (bindings 9, 10)
+// DiagHeader: [0] = pair_count, [1] = overflow_count
+layout(std430, binding = 9) buffer DiagHeader { uint diag_header[]; };
+
+struct GPUPairRecord {
+    uint i;
+    uint j;
+    float dist;
+    float err;
+    float normal_x;
+    float normal_y;
+    float normal_z;
+    float vrel_x;
+    float vrel_y;
+    float vrel_z;
+    float vn;
+    float vt_len;
+    float denom;
+    float lambda_n;
+    float lambda_f;
+    float delta_ix;
+    float delta_iy;
+    float delta_iz;
+    uint iter_index;
+    uint pad0;
+};
+layout(std430, binding = 10) buffer DiagPairs { GPUPairRecord diag_pairs[]; };
+
+layout(push_constant) uniform Push {
+    float k_mu;
+    float k_cohesion;
+    float max_radius;
+    float dt;
+    float relaxation;
+    float n_particles;    // as float; cast in shader
+    float cell_width_inv;
+    uint iter_index;
+    uint enable_diagnostics;
+    uint max_diag_pairs;
+    uint pad1;
+    uint pad2;
+} pc;
+
+int cell_index(int x, int y, int z) {
+    // hash_grid_index: virtual -> physical, with +2^20 offset and wrap
+    x += GRID_ORIGIN;
+    y += GRID_ORIGIN;
+    z += GRID_ORIGIN;
+    x = max(0, x);
+    y = max(0, y);
+    z = max(0, z);
+    int cx = x % GRID_DIM;
+    int cy = y % GRID_DIM;
+    int cz = z % GRID_DIM;
+    return cz * (GRID_DIM * GRID_DIM) + cy * GRID_DIM + cx;
+}
+
+float exact_sqrt(float a) {
+    float d = sqrt(a);
+    float r = fma(-d, d, a);
+    return fma(r, 0.5 / d, d);
+}
+
+float exact_length(vec3 a) {
+    float yy = a.y * a.y;
+    float xx_yy = fma(a.x, a.x, yy);
+    float sq = fma(a.z, a.z, xx_yy);
+    return exact_sqrt(sq);
+}
+
+float exact_dot(vec3 a, vec3 b) {
+    float y = a.y * b.y;
+    float x_y = fma(a.x, b.x, y);
+    return fma(a.z, b.z, x_y);
+}
+
+vec3 exact_div(vec3 v, float d) {
+    float inv_d = 1.0 / d;
+    vec3 q = v * inv_d;
+    vec3 rem = fma(vec3(-d), q, v);
+    return fma(rem, vec3(inv_d), q);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int n = int(pc.n_particles);
+    if (tid >= uint(n)) return;
+
+    // hash_grid_point_id(grid, tid): thread reordering by cell
+    int i = point_ids[tid];
+    if (i == -1) return;   // grid not built
+
+    int pflag = flags_arr[i];
+    if ((pflag & 1) == 0) return;             // ACTIVE
+    int is_proxy = pflag & 2;                 // PROXY flag check
+
+    vec3 x = x_arr[i].xyz;
+    vec3 v = v_arr[i].xyz;
+    float radius = radius_arr[i];
+    float w1 = invmass[i];
+
+    // hash_grid_query(grid, x, radius + max_radius + k_cohesion)
+    float R = radius + pc.max_radius + pc.k_cohesion;
+    float inv = pc.cell_width_inv;
+    int xs = int(floor((x.x - R) * inv));
+    int ys = int(floor((x.y - R) * inv));
+    int zs = int(floor((x.z - R) * inv));
+    int xe = min(int(floor((x.x + R) * inv)), xs + GRID_DIM - 1);
+    int ye = min(int(floor((x.y + R) * inv)), ys + GRID_DIM - 1);
+    int ze = min(int(floor((x.z + R) * inv)), zs + GRID_DIM - 1);
+
+    vec3 delta = vec3(0.0);
+
+    // hash_grid_query_next order: x fastest, then y, then z
+    for (int cz = zs; cz <= ze; cz++) {
+        for (int cy = ys; cy <= ye; cy++) {
+            for (int cx = xs; cx <= xe; cx++) {
+                int cell = cell_index(cx, cy, cz);
+                int s = cell_starts[cell];
+                int e = cell_ends[cell];
+                for (int k = s; k < e; k++) {
+                    int j = point_ids[k];
+                    int nflag = flags_arr[j];
+                    bool nactive = (nflag & 1) != 0;
+                    bool proxy_ok = (is_proxy == 0) || (((nflag & 2) == 0) && (invmass[j] > 0.0));
+                    if (nactive && proxy_ok && j != i) {
+                        vec3 raw_diff = x - x_arr[j].xyz;
+                        vec3 nn = raw_diff;
+                        float d = exact_length(nn);
+                        float err = d - radius - radius_arr[j];
+
+                        float w2 = invmass[j];
+                        float denom = w1 + w2;
+
+                        if (err <= pc.k_cohesion && denom > 0.0 && d > 0.0) {
+                            nn = exact_div(nn, d);
+                            vec3 vrel = v - v_arr[j].xyz;
+
+                            float lambda_n = err;
+                            vec3 delta_n = nn * lambda_n;
+
+                            float vn = exact_dot(nn, vrel);
+                            precise vec3 vt = fma(vec3(vn), -nn, vrel);
+
+                            float vt_len = exact_length(vt);
+                            float lambda_f = max(pc.k_mu * lambda_n, -vt_len * pc.dt);
+                            precise vec3 vt_dir = vt_len > 0.0 ? exact_div(vt, vt_len) : vec3(0.0);
+                            precise vec3 p2 = nn * err;
+                            precise vec3 diff = fma(vt_dir, vec3(lambda_f), -p2);
+                            vec3 pair_d = exact_div(diff, denom);
+                            delta += pair_d;
+
+                            if (pc.enable_diagnostics != 0u) {
+                                uint slot = atomicAdd(diag_header[0], 1u);
+                                if (slot < pc.max_diag_pairs) {
+                                    vec3 d_i = fma(fma(pair_d, vec3(w1), vec3(0.0)), vec3(pc.relaxation), vec3(0.0));
+                                    diag_pairs[slot].i = uint(i);
+                                    diag_pairs[slot].j = uint(j);
+                                    diag_pairs[slot].dist = d;
+                                    diag_pairs[slot].err = err;
+                                    diag_pairs[slot].normal_x = nn.x;
+                                    diag_pairs[slot].normal_y = nn.y;
+                                    diag_pairs[slot].normal_z = nn.z;
+                                    diag_pairs[slot].vrel_x = vrel.x;
+                                    diag_pairs[slot].vrel_y = vrel.y;
+                                    diag_pairs[slot].vrel_z = vrel.z;
+                                    diag_pairs[slot].vn = vn;
+                                    diag_pairs[slot].vt_len = vt_len;
+                                    diag_pairs[slot].denom = denom;
+                                    diag_pairs[slot].lambda_n = lambda_n;
+                                    diag_pairs[slot].lambda_f = lambda_f;
+                                    diag_pairs[slot].delta_ix = d_i.x;
+                                    diag_pairs[slot].delta_iy = d_i.y;
+                                    diag_pairs[slot].delta_iz = d_i.z;
+                                    diag_pairs[slot].iter_index = pc.iter_index;
+                                    diag_pairs[slot].pad0 = 0u;
+                                } else {
+                                    atomicAdd(diag_header[1], 1u); // overflow counter
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    vec3 delta_w1 = fma(delta, vec3(w1), vec3(0.0));
+    vec3 total = fma(delta_w1, vec3(pc.relaxation), vec3(0.0));
+    atomicAdd(deltas[i * 3 + 0], total.x);
+    atomicAdd(deltas[i * 3 + 1], total.y);
+    atomicAdd(deltas[i * 3 + 2], total.z);
+}

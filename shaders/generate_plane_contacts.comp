@@ -1,0 +1,54 @@
+// generate_plane_contacts - GPU analytic plane-contact generation.
+// Generates contacts against the ground plane (z = altitude):
+//   contact iff pz < soft_margin + radius
+//   body_pos = (px, py, altitude), body_vel = 0, normal = (0,0,1), shape = 0
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ParticleX { vec4 px_arr[]; };
+layout(std430, binding = 1) readonly buffer ParticleRadius { float particle_radius[]; };
+layout(std430, binding = 2) readonly buffer ParticleFlags { int particle_flags[]; };
+layout(std430, binding = 3) writeonly buffer ContactCount { int contact_count[]; };
+layout(std430, binding = 4) writeonly buffer ContactParticle { int contact_particle[]; };
+layout(std430, binding = 5) writeonly buffer ContactShape { int contact_shape[]; };
+layout(std430, binding = 6) writeonly buffer ContactBodyPos { float contact_body_pos[]; };  // packed vec3
+layout(std430, binding = 7) writeonly buffer ContactBodyVel { float contact_body_vel[]; };  // packed vec3
+layout(std430, binding = 8) writeonly buffer ContactNormal { float contact_normal[]; };     // packed vec3
+
+layout(push_constant) uniform PC {
+    float soft_margin;   // CollisionPipeline default 0.01
+    float altitude;      // ground_plane_altitude
+    uint contact_max;
+    float pad0;
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint n = px_arr.length();
+    if (tid >= n) return;
+
+    int flags = particle_flags[tid];
+    if ((flags & 1) == 0) return;  // ParticleFlags.ACTIVE
+
+    vec3 p = px_arr[tid].xyz;
+    float radius = particle_radius[tid];
+    float dist = p.z - pc.altitude;
+    if (!(dist < pc.soft_margin + radius)) return;
+
+    int slot = atomicAdd(contact_count[0], 1);
+    if (slot >= int(pc.contact_max)) return;
+
+    contact_particle[slot] = int(tid);
+    contact_shape[slot] = 0;
+    contact_body_pos[slot * 3 + 0] = p.x;
+    contact_body_pos[slot * 3 + 1] = p.y;
+    contact_body_pos[slot * 3 + 2] = pc.altitude;
+    contact_body_vel[slot * 3 + 0] = 0.0;
+    contact_body_vel[slot * 3 + 1] = 0.0;
+    contact_body_vel[slot * 3 + 2] = 0.0;
+    contact_normal[slot * 3 + 0] = 0.0;
+    contact_normal[slot * 3 + 1] = 0.0;
+    contact_normal[slot * 3 + 2] = 1.0;
+}

@@ -1,0 +1,35 @@
+// finalize_particle_velocity - Derives particle velocity from substep positional change:
+//   v_new = (x_new - x0) / dt
+//   clamp |v_new| to v_max; if clamped: x_new = x0 + v_new*dt
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer XIn { vec4 x_in[]; };    // post-integrate x
+layout(std430, binding = 1) readonly buffer XInit { vec4 x_init[]; }; // x at start of step
+layout(std430, binding = 2) writeonly buffer VOut { vec4 v_out[]; };
+
+layout(push_constant) uniform PC {
+    float dt;
+    float v_max;
+    float _pad0;
+    float _pad1;
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(x_in.length())) return;
+
+    vec3 x_new = x_in[tid].xyz;
+    vec3 x0 = x_init[tid].xyz;
+
+    vec3 v_new = (x_new - x0) / pc.dt;
+
+    float m = length(v_new);
+    if (m > pc.v_max) {
+        v_new *= pc.v_max / m;
+        x_new = x0 + v_new * pc.dt;  // matches reference clamp path
+    }
+
+    v_out[tid] = vec4(v_new, 0.0);
+}

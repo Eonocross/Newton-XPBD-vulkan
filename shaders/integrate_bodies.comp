@@ -1,0 +1,124 @@
+// integrate_bodies - Rigid body time integration.
+//
+// Rigid body integration:
+//   Linear: v1 = v0 + (f0 * inv_mass + gravity) * dt; x1 = x_com + v1 * dt
+//   Angular: wb = rotate_inv(r0, w0); tb = rotate_inv(r0, t0) - cross(wb, I*wb)
+//            w1 = rotate(r0, wb + inv_I * tb * dt)
+//            r1 = normalize(r0 + quat(w1, 0) * r0 * 0.5 * dt)
+//            w1 *= 1.0 - angular_damping * dt
+#version 450
+
+layout(local_size_x = 64) in;
+
+// body_q: stride 8 floats per body (7 used + 1 pad for vec4 alignment x2)
+layout(std430, binding = 0) readonly buffer BodyQ { vec4 body_q[]; };      // 2 vec4 per body
+layout(std430, binding = 1) readonly buffer BodyQd { vec4 body_qd[]; };    // 2 vec4 per body: [lin, pad] [ang, pad]
+layout(std430, binding = 2) readonly buffer BodyF { vec4 body_f[]; };      // same layout as qd
+layout(std430, binding = 3) readonly buffer BodyCom { vec4 body_com[]; };  // (xyz, pad)
+layout(std430, binding = 4) readonly buffer BodyI { float body_inertia[]; };   // 9 floats per body, column-major
+layout(std430, binding = 5) readonly buffer BodyInvM { float body_inv_mass[]; };
+layout(std430, binding = 6) readonly buffer BodyInvI { float body_inv_inertia[]; }; // 9 floats per body
+layout(std430, binding = 7) readonly buffer BodyFlags { int body_flags[]; };
+layout(std430, binding = 8) readonly buffer BodyWorld { int body_world[]; };
+layout(std430, binding = 9) readonly buffer Gravity { vec4 gravity[]; };
+
+layout(std430, binding = 10) writeonly buffer BodyQNew { vec4 body_q_new[]; };
+layout(std430, binding = 11) writeonly buffer BodyQdNew { vec4 body_qd_new[]; };
+
+layout(push_constant) uniform PC {
+    float dt;
+    float angular_damping;
+    float _pad0;
+    float _pad1;
+} pc;
+
+const int BODY_Q_STRIDE = 2;   // vec4s per body
+const int BODY_QD_STRIDE = 2;
+const int BODY_I_STRIDE = 9;   // floats per body (tightly packed mat33)
+const int KINEMATIC = 2;       // BodyFlags.KINEMATIC = 1 << 1
+
+vec3 inertia_col(const float m[9], int col) {
+    int base = col * 3;
+    return vec3(m[base + 0], m[base + 1], m[base + 2]);
+}
+
+// M*v with column-major tightly-packed 3x3
+vec3 inertia_mul_f(const float m[9], vec3 v) {
+    return inertia_col(m, 0) * v.x + inertia_col(m, 1) * v.y + inertia_col(m, 2) * v.z;
+}
+
+// Hamilton product p*q (quaternion multiplication)
+vec4 quat_mul(vec4 p, vec4 q) {
+    // (w1,w2) (xyz1,xyz2): w = w1*w2 - dot(xyz1,xyz2); xyz = w1*xyz2 + w2*xyz1 + cross(xyz1,xyz2)
+    float w = p.w * q.w - dot(p.xyz, q.xyz);
+    vec3 xyz = p.w * q.xyz + q.w * p.xyz + cross(p.xyz, q.xyz);
+    return vec4(xyz, w);
+}
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    // rotate: v + 2*cross(q.xyz, cross(q.xyz, v) + v*q.w)
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + v * q.w);
+}
+
+vec3 quat_rotate_inv(vec4 q, vec3 v) {
+    return quat_rotate(vec4(-q.xyz, q.w), v);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(body_q.length() / BODY_Q_STRIDE)) return;
+
+    uint qi = tid * BODY_Q_STRIDE;
+    int ib = int(tid);
+
+    if ((body_flags[tid] & KINEMATIC) != 0) {
+        body_q_new[qi + 0] = body_q[qi + 0];
+        body_q_new[qi + 1] = body_q[qi + 1];
+        body_qd_new[tid * BODY_QD_STRIDE + 0] = body_qd[tid * BODY_QD_STRIDE + 0];
+        body_qd_new[tid * BODY_QD_STRIDE + 1] = body_qd[tid * BODY_QD_STRIDE + 1];
+        return;
+    }
+
+    vec3 x0 = body_q[qi].xyz;
+    vec4 r0 = body_q[qi + 1];                    // (x,y,z,w)
+    vec3 v0 = body_qd[tid * BODY_QD_STRIDE].xyz; // linear
+    vec3 w0 = body_qd[tid * BODY_QD_STRIDE + 1].xyz; // angular
+    vec3 f0 = body_f[tid * BODY_QD_STRIDE].xyz;
+    vec3 t0 = body_f[tid * BODY_QD_STRIDE + 1].xyz;
+    vec3 com = body_com[tid].xyz;
+    float inv_mass = body_inv_mass[tid];
+
+    int world_idx = body_world[tid];
+    vec3 world_g = gravity[max(world_idx, 0)].xyz;
+
+    vec3 x_com = x0 + quat_rotate(r0, com);
+
+    float m_scale = inv_mass != 0.0 ? 1.0 : 0.0;   // Nonzero mass check
+    vec3 v1 = v0 + (f0 * inv_mass + world_g * m_scale) * pc.dt;
+    vec3 x1 = x_com + v1 * pc.dt;
+
+    // angular part in body frame
+    vec3 wb = quat_rotate_inv(r0, w0);
+    float I9[9];
+    float Iinv9[9];
+    for (int k = 0; k < 9; k++) {
+        I9[k] = body_inertia[ib * 9 + k];
+        Iinv9[k] = body_inv_inertia[ib * 9 + k];
+    }
+    vec3 Iwb = inertia_mul_f(I9, wb);
+    vec3 tb = quat_rotate_inv(r0, t0) - cross(wb, Iwb);
+    vec3 dwb = inertia_mul_f(Iinv9, tb) * pc.dt;
+    vec3 w1 = quat_rotate(r0, wb + dwb);
+    vec4 r1 = normalize(r0 + quat_mul(vec4(w1, 0.0), r0) * (0.5 * pc.dt));
+
+    // angular damping
+    w1 *= 1.0 - pc.angular_damping * pc.dt;
+
+    vec4 q_new_pos = vec4(x1 - quat_rotate(r1, com), 0.0);
+    vec4 q_new_rot = r1;
+
+    body_q_new[qi + 0] = q_new_pos;
+    body_q_new[qi + 1] = q_new_rot;
+    body_qd_new[tid * BODY_QD_STRIDE + 0] = vec4(v1, 0.0);
+    body_qd_new[tid * BODY_QD_STRIDE + 1] = vec4(w1, 0.0);
+}

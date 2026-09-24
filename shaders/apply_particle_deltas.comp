@@ -1,0 +1,61 @@
+// apply_particle_deltas - Applies positional deltas to particles and computes velocities.
+//
+// Update logic:
+//   if (flags & ACTIVE) == 0: return
+//   x_new = x_pred + delta
+//   v_new = (x_new - x_orig) / dt
+//   if |v_new| > v_max: v_new *= v_max/|v_new|; x_new = x_orig + v_new*dt
+//   x_out = x_new; v_out = v_new
+//
+// Notes:
+//   - x_orig is the pre-integration state. Velocity is derived from the total
+//     positional change across the substep.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XOrig { vec4 x_orig[]; };
+layout(std430, binding = 1) readonly buffer XPred { vec4 x_pred[]; };
+layout(std430, binding = 2) readonly buffer ParticleFlags { int particle_flags[]; };
+layout(std430, binding = 3) readonly buffer Delta { float delta[]; };  // 3 floats/particle (tight)
+
+layout(push_constant) uniform Push {
+    float dt;
+    float v_max;
+    float pad0;
+    float pad1;
+} pc;
+
+layout(std430, binding = 4) buffer XOut { vec4 x_out[]; };
+layout(std430, binding = 5) buffer VOut { vec4 v_out[]; };
+
+// Exact division via Markstein / FMA refinement to guarantee bit-identical IEEE fdiv
+vec3 exact_div(vec3 a, float b) {
+    float y = 1.0 / b;
+    y = fma(-b, y, 1.0) * y + y;
+    vec3 q = a * y;
+    vec3 r = fma(-q, vec3(b), a);
+    return fma(r, vec3(y), q);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= x_orig.length()) return;
+    if ((particle_flags[tid] & 1) == 0) return;  // ParticleFlags.ACTIVE
+
+    vec3 x0 = x_orig[tid].xyz;
+    vec3 xp = x_pred[tid].xyz;
+    vec3 d = vec3(delta[tid * 3 + 0], delta[tid * 3 + 1], delta[tid * 3 + 2]);
+
+    vec3 x_new = xp + d;
+    vec3 v_new = exact_div(x_new - x0, pc.dt);
+
+    float v_mag = length(v_new);
+    if (v_mag > pc.v_max) {
+        v_new *= pc.v_max / v_mag;
+        x_new = x0 + v_new * pc.dt;
+    }
+
+    x_out[tid] = vec4(x_new, 0.0);
+    v_out[tid] = vec4(v_new, 0.0);
+}

@@ -1,0 +1,186 @@
+// solve_particle_shape_contacts - Resolves particle-shape contact constraints.
+// Computes normal corrections and friction deltas, accumulating into
+// particle deltas and body deltas.
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ParticleX { vec4 px_arr[]; };   // vec4 slots
+layout(std430, binding = 1) readonly buffer ParticleV { vec4 pv_arr[]; };   // vec4 slots
+layout(std430, binding = 2) readonly buffer ParticleInvMass { float particle_invmass[]; };
+layout(std430, binding = 3) readonly buffer ParticleRadius { float particle_radius[]; };
+layout(std430, binding = 4) readonly buffer ParticleFlags { int particle_flags[]; };
+// body_q: per-body stride 8 floats = 2 x vec4: slot0.xyz = position,
+// slot1 = quaternion (qx,qy,qz,qw). (Transform = [px,py,pz,qx,qy,qz,qw].)
+layout(std430, binding = 5) readonly buffer BodyQ { vec4 body_q[]; };
+// body_qd: per-body stride 8 floats = 2 x vec4: slot0.xyz = linear (top),
+// slot1.xyz = angular (bottom).
+layout(std430, binding = 6) readonly buffer BodyQd { vec4 body_qd[]; };
+layout(std430, binding = 7) readonly buffer BodyCom { float body_com[]; };  // 3 floats/body (tight)
+// body_inv_inertia: tightly packed 9 floats per body
+layout(std430, binding = 8) readonly buffer BodyInvInertia { float body_inv_I[]; };
+layout(std430, binding = 9) readonly buffer BodyInvMass { float body_inv_m[]; };
+layout(std430, binding = 10) readonly buffer BodyFlags { int body_flags[]; };
+layout(std430, binding = 11) readonly buffer ShapeBody { int shape_body[]; };
+layout(std430, binding = 12) readonly buffer ShapeMaterialMu { float shape_material_mu[]; };
+layout(std430, binding = 13) readonly buffer ContactCount { int contact_count[]; };
+layout(std430, binding = 14) readonly buffer ContactParticle { int contact_particle[]; };
+layout(std430, binding = 15) readonly buffer ContactShape { int contact_shape[]; };
+layout(std430, binding = 16) readonly buffer ContactBodyPos { float c_body_pos[]; };  // 3/contact (tight)
+layout(std430, binding = 17) readonly buffer ContactBodyVel { float c_body_vel[]; };  // 3/contact (tight)
+layout(std430, binding = 18) readonly buffer ContactNormal { float c_normal[]; };     // 3/contact (tight)
+// particle_deltas: 3 floats per particle (tight)
+layout(std430, binding = 19) buffer ParticleDelta { float particle_delta[]; };
+// body_delta: spatial vector per body, 8-float stride (lin at +0..2, ang at +4..6)
+layout(std430, binding = 20) buffer BodyDelta { float body_delta[]; };
+
+layout(push_constant) uniform Push {
+    float particle_mu;
+    float particle_ka;
+    float contact_max;
+    float dt;
+    float relaxation;
+} pc;
+
+float mat33_at(int body, int r, int c) {
+    return body_inv_I[body * 9 + r * 3 + c];
+}
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+vec3 quat_rotate_inv(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) - q.w * v);
+}
+
+vec3 mat33_mul(int body, vec3 v) {
+    return vec3(
+        mat33_at(body,0,0)*v.x + mat33_at(body,0,1)*v.y + mat33_at(body,0,2)*v.z,
+        mat33_at(body,1,0)*v.x + mat33_at(body,1,1)*v.y + mat33_at(body,1,2)*v.z,
+        mat33_at(body,2,0)*v.x + mat33_at(body,2,1)*v.y + mat33_at(body,2,2)*v.z);
+}
+
+void atomic_add_body(uint body, uint comp_offset, vec3 v) {
+    atomicAdd(body_delta[body * 8u + comp_offset + 0u], v.x);
+    atomicAdd(body_delta[body * 8u + comp_offset + 1u], v.y);
+    atomicAdd(body_delta[body * 8u + comp_offset + 2u], v.z);
+}
+
+
+vec3 exact_div(vec3 v, float d) {
+    float inv_d = 1.0 / d;
+    vec3 q = v * inv_d;
+    vec3 rem = fma(vec3(-d), q, v);
+    return fma(rem, vec3(inv_d), q);
+}
+
+float exact_length(vec3 v) {
+    precise float l2 = v.y * v.y;
+    l2 = fma(v.x, v.x, l2);
+    l2 = fma(v.z, v.z, l2);
+    if (l2 <= 0.0) return 0.0;
+    precise float rsq = inversesqrt(l2);
+    precise float y0 = l2 * rsq;
+    precise float h0 = 0.5 * rsq;
+    precise float err = fma(-y0, y0, l2);
+    precise float vt_len = fma(err, h0, y0);
+    return vt_len;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int count = min(int(pc.contact_max), contact_count[0]);
+    if (tid >= uint(count)) return;
+
+    int shape_index = contact_shape[tid];
+    int body_index = shape_body[shape_index];
+    int particle_index = contact_particle[tid];
+
+    int pflag = particle_flags[particle_index];
+    if ((pflag & 1) == 0) return;                 // ParticleFlags.ACTIVE
+    if ((pflag & 2) != 0) {                       // ParticleFlags.PROXY
+        if (body_index < 0) return;
+        if ((body_flags[body_index] & 4) != 0) return;  // BodyFlags.PROXY
+        if (body_inv_m[body_index] == 0.0) return;
+    }
+
+    vec3 px = px_arr[particle_index].xyz;
+    vec3 pv = pv_arr[particle_index].xyz;
+
+    vec3 X_pos = vec3(0.0);
+    vec4 X_rot = vec4(0.0, 0.0, 0.0, 1.0);        // identity (x,y,z,w)
+    vec3 X_com = vec3(0.0);
+
+    if (body_index >= 0) {
+        X_pos = body_q[body_index * 2].xyz;
+        X_rot = body_q[body_index * 2 + 1];
+        X_com = vec3(body_com[body_index * 3 + 0], body_com[body_index * 3 + 1], body_com[body_index * 3 + 2]);
+    }
+
+    // body anchor in world space: bx = transform_point(X_wb, contact_body_pos)
+    vec3 bx = X_pos + quat_rotate(X_rot, vec3(c_body_pos[tid * 3 + 0], c_body_pos[tid * 3 + 1], c_body_pos[tid * 3 + 2]));
+    // r = bx - transform_point(X_wb, X_com)
+    vec3 r = bx - (X_pos + quat_rotate(X_rot, X_com));
+
+    vec3 n = vec3(c_normal[tid * 3 + 0], c_normal[tid * 3 + 1], c_normal[tid * 3 + 2]);
+    float c = dot(n, px - bx) - particle_radius[particle_index];
+
+    if (c > pc.particle_ka) return;
+
+    // average material properties of shape and particle
+    float mu = 0.5 * (pc.particle_mu + shape_material_mu[shape_index]);
+
+    vec3 body_v = vec3(0.0);
+    vec3 body_w = vec3(0.0);
+    if (body_index >= 0) {
+        body_v = body_qd[body_index * 2 + 0].xyz;  // spatial_top
+        body_w = body_qd[body_index * 2 + 1].xyz;  // spatial_bottom
+    }
+
+    // body velocity at the particle position
+    vec3 bv = body_v + cross(body_w, r) + quat_rotate(X_rot, vec3(c_body_vel[tid * 3 + 0], c_body_vel[tid * 3 + 1], c_body_vel[tid * 3 + 2]));
+
+    // relative velocity
+    vec3 v = pv - bv;
+
+    // normal correction
+    precise float lambda_n = c;
+    precise vec3 delta_n = n * lambda_n;
+
+    // friction
+    precise float vn = n.y * v.y;
+    vn = fma(n.x, v.x, vn);
+    vn = fma(n.z, v.z, vn);
+    precise vec3 vt = fma(-n, vec3(vn), v);
+
+    // inverse masses
+    float w1 = particle_invmass[particle_index];
+    float w2 = 0.0;
+    if (body_index >= 0) {
+        vec3 angular = cross(r, n);
+        vec3 rot_angular = quat_rotate_inv(X_rot, angular);
+        w2 = body_inv_m[body_index] + dot(rot_angular, mat33_mul(body_index, rot_angular));
+    }
+    precise float denom = w1 + w2;
+    if (denom == 0.0) return;
+
+    precise float vt_len = exact_length(vt);
+    precise float lambda_f = max(mu * lambda_n, -vt_len * pc.dt);
+    precise vec3 vt_dir = (vt_len > 0.0) ? exact_div(vt, vt_len) : vec3(0.0);
+    precise vec3 diff = fma(vt_dir, vec3(lambda_f), -delta_n);
+    precise vec3 delta_total = exact_div(diff, denom) * pc.relaxation;
+    precise vec3 final_delta = w1 * delta_total;
+
+    atomicAdd(particle_delta[particle_index * 3 + 0], final_delta.x);
+    atomicAdd(particle_delta[particle_index * 3 + 1], final_delta.y);
+    atomicAdd(particle_delta[particle_index * 3 + 2], final_delta.z);
+
+    if (body_index >= 0 && body_inv_m[body_index] > 0.0) {
+        // body_delta is velocity-like: convert positional correction
+        precise vec3 delta_v = delta_total / pc.dt;
+        precise vec3 delta_w = cross(r, delta_v);
+        atomic_add_body(uint(body_index), 0u, -delta_v);   // spatial top (lin)
+        atomic_add_body(uint(body_index), 4u, -delta_w);   // spatial bottom (ang)
+    }
+}
