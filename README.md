@@ -1,5 +1,5 @@
 # Newton-XPBD-vulkan
-Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver across different hardwares using vulkan. Currently only has plugins for Blender (tested only on Blender 5.x)
+Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver across different hardwares using vulkan. Currently only has plugins for Blender (tested only on Blender 5.x) with only cached simulation/playback (no realtime)
 
 > [!IMPORTANT]
 > **HARDWARE COMPATIBILITY NOTICE**:  
