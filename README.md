@@ -9,9 +9,13 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 # Quick Setup Guide (Pre-built Release)
 
-Releases are provided as two separate `.zip` packages on GitHub:
-1. **`newton_vulkan_binaries_v..._<platform>.zip`**: Contains the compiled Vulkan C++ solver (`vkxpbd.pyd` / `vkxpbd.so`) and all 17 SPIR-V compute shaders (`vkxpbd_shaders/*.spv`).
-2. **`newton_vulkan_plugin_v....zip`**: Contains the Blender Python plugin (`newton_vulkan_plugin.py`).
+### Downloads
+
+| Package | Version | Contents | Download Link |
+| :--- | :---: | :--- | :--- |
+| **Vulkan Binaries & Shaders** | `v1.34` | Pre-built Vulkan 1.3 engine (`vkxpbd.pyd`) & 17 SPIR-V compute shaders | [**Download Windows x64 ZIP**](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.34) |
+| **Blender Plugin** | `v1.0` | Blender addon Python script (`newton_vulkan_plugin.py`) | [**Download Plugin ZIP**](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/plugin-v1.0) |
+
 
 ### Step 1: Install Vulkan Modules & Shaders
 Download the binaries package for your OS and extract the `modules/` folder directly into your Blender `addons` directory:
