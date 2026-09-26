@@ -13,7 +13,7 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 | Package | Version | Contents | Download Link |
 | :--- | :---: | :--- | :--- |
-| **Vulkan Binaries & Shaders** | `v1.34` | Pre-built Vulkan 1.3 engine (`vkxpbd.pyd`) & 17 SPIR-V compute shaders | [**Download Windows x64 ZIP**](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.34) |
+| **Vulkan Binaries & Shaders** | `v1.34` | Pre-built Vulkan 1.3 engine (`vkxpbd.pyd`) & 17 SPIR-V compute shaders | [**Download Windows/Linux x64 ZIP**](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.34) |
 | **Blender Plugin** | `v1.0` | Blender addon Python script (`newton_vulkan_plugin.py`) | [**Download Plugin ZIP**](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/plugin-v1.0) |
 
 
