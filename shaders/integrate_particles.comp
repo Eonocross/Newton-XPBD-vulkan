@@ -1,8 +1,10 @@
-// integrate_particles - Particle time integration.
+// integrate_particles - Forward Euler / symplectic integration for particles.
+// Based on newton/newton/_src/solvers/solver.py::integrate_particles
 //
-// Integration:
-//   v1 = v0 + (f0 * inv_mass + gravity) * dt
-//   v1 = clamp(v1, v_max)
+// Math:
+//   if (particle_flags[tid] & ACTIVE) == 0: x_new = x0; return
+//   v1 = v0 + (f0 * inv_mass + world_g * (inv_mass > 0 ? 1 : 0)) * dt
+//   v1 magnitude clamped to v_max
 //   x1 = x0 + v1 * dt
 #version 450
 
@@ -43,7 +45,7 @@ void main() {
     int world_idx = particle_world[tid];
     vec3 world_g = gravity[max(world_idx, 0)].xyz;
 
-    // wp.step(-inv_mass) == float(inv_mass > 0)  — see header note (INVERTED vs GLSL step)
+    // wp.step(-inv_mass) == float(inv_mass > 0)
     float g_scale = inv_mass > 0.0 ? 1.0 : 0.0;
     vec3 v1 = v0 + (f0 * inv_mass + world_g * g_scale) * pc.dt;
 

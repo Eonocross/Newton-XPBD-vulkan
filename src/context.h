@@ -30,6 +30,8 @@ struct Context {
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE; // primary, rerecorded per use
     VkPhysicalDeviceProperties props{};
+    bool supports_subgroup_size_32 = false;
+    bool supports_float_controls = false;
 
     ~Context() { destroy(); }
 
@@ -63,12 +65,10 @@ struct Context {
             names.push_back(std::string(p.deviceName));
         }
 
-        // Do not destroy instance if Blender shared Vulkan runtime is active,
-        // or safely retain reference.
         return names;
     }
 
-    void init(bool enable_validation = false, int device_index = -1) {
+    void init(bool enable_validation = false, int device_index = -1, bool compat_mode = false) {
         volkInitialize();
 
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -113,15 +113,11 @@ struct Context {
         if (device_index >= 0 && (uint32_t)device_index < nd) {
             chosen_idx = (uint32_t)device_index;
         } else {
-            // Auto-selection heuristic: prefer discrete GPU (e.g. NVIDIA) over integrated
-            bool found_discrete = false;
             for (uint32_t i = 0; i < nd; i++) {
                 VkPhysicalDeviceProperties p{};
                 vkGetPhysicalDeviceProperties(devs[i], &p);
                 if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
                     chosen_idx = i;
-                    found_discrete = true;
-                    // If it is NVIDIA (vendor 0x10DE), prioritize it immediately
                     if (p.vendorID == 0x10DE) {
                         break;
                     }
@@ -150,29 +146,84 @@ struct Context {
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
 
-        // fp32 atomicAdd on storage buffers is required by the contact/joint
-        // scatter kernels (VK_EXT_shader_atomic_float).
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        dci.queueCreateInfoCount = 1;
+        dci.pQueueCreateInfos = &qci;
+
+        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        f13.synchronization2 = VK_TRUE;
+
+        // Check for VK_EXT_subgroup_size_control / Vulkan 1.3 subgroupSizeControl
+        VkPhysicalDeviceSubgroupSizeControlFeaturesEXT ssc{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+        VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+        
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &ssp;
+        vkGetPhysicalDeviceProperties2(physical_device, &p2);
+
+        VkPhysicalDeviceFeatures2 f2_check{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        f2_check.pNext = &ssc;
+        vkGetPhysicalDeviceFeatures2(physical_device, &f2_check);
+
+        if (ssc.subgroupSizeControl && (ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+            ssp.minSubgroupSize <= 32 && ssp.maxSubgroupSize >= 32) {
+            ssc.subgroupSizeControl = VK_TRUE;
+            supports_subgroup_size_32 = true;
+            f13.pNext = &ssc;
+        }
+
+        printf("[Newton Vulkan] Device [%u] Subgroup Query: control=%d, reqStages=0x%x, min=%u, max=%u, active32=%d\n",
+               chosen_idx, (int)ssc.subgroupSizeControl, (unsigned)ssp.requiredSubgroupSizeStages,
+               ssp.minSubgroupSize, ssp.maxSubgroupSize, (int)supports_subgroup_size_32);
+
+        std::vector<const char*> dev_exts;
+        if (supports_subgroup_size_32) {
+            dev_exts.push_back("VK_EXT_subgroup_size_control");
+        }
+
+        // Check for VK_KHR_shader_float_controls
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> available_exts(ext_count);
+        vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &ext_count, available_exts.data());
+        for (const auto& e : available_exts) {
+            if (strcmp(e.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 0) {
+                supports_float_controls = true;
+                dev_exts.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+                break;
+            }
+        }
+
+        VkPhysicalDeviceFloatControlsProperties fc_props{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        if (supports_float_controls) {
+            VkPhysicalDeviceProperties2 p2_fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2_fc.pNext = &fc_props;
+            vkGetPhysicalDeviceProperties2(physical_device, &p2_fc);
+        }
+
+        const char* atomics_ext = "VK_EXT_shader_atomic_float";
         VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
-        {
+
+        if (!compat_mode) {
             VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             f2.pNext = &af;
             vkGetPhysicalDeviceFeatures2(physical_device, &f2);
             if (!af.shaderBufferFloat32AtomicAdd)
                 throw std::runtime_error("device lacks shaderBufferFloat32AtomicAdd (required)");
+
+            af.pNext = f13.pNext;
+            f13.pNext = &af;
+            dev_exts.push_back(atomics_ext);
         }
 
-        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        // Vulkan 1.3 core: timelineSemaphore + sync2 are always available
-        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        f13.synchronization2 = VK_TRUE;
         dci.pNext = &f13;
-        f13.pNext = &af; // chain: core13 -> atomic float
-        const char* atomics_ext = "VK_EXT_shader_atomic_float";
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = &atomics_ext;
+        dci.enabledExtensionCount = (uint32_t)dev_exts.size();
+        dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+
         VK_CHECK(vkCreateDevice(physical_device, &dci, nullptr, &device));
         volkLoadDevice(device);
 
@@ -189,7 +240,11 @@ struct Context {
         cai.commandBufferCount = 1;
         VK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
 
-        printf("[Newton Vulkan] Using device [%u]: %s (queue family %u)\n", chosen_idx, props.deviceName, compute_queue_family);
+        printf("[Newton Vulkan] Using device [%u]: %s (queue family %u%s%s%s)\n",
+               chosen_idx, props.deviceName, compute_queue_family,
+               compat_mode ? ", compatibility mode" : "",
+               supports_subgroup_size_32 ? ", subgroup_size=32" : "",
+               supports_float_controls ? ", float_controls" : "");
     }
 
     void destroy() {

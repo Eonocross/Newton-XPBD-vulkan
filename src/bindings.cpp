@@ -29,6 +29,7 @@ PYBIND11_MODULE(vkxpbd, m) {
         .def_readwrite("ground_plane_altitude", &vkx::SolverConfig::ground_plane_altitude)
         .def_readwrite("shader_dir", &vkx::SolverConfig::shader_dir)
         .def_readwrite("device_index", &vkx::SolverConfig::device_index)
+        .def_readwrite("compat_mode", &vkx::SolverConfig::compat_mode)
         .def_readwrite("enable_validation", &vkx::SolverConfig::enable_validation)
         .def_readwrite("enable_diagnostics", &vkx::SolverConfig::enable_diagnostics)
         .def_readwrite("max_diag_pairs", &vkx::SolverConfig::max_diag_pairs)

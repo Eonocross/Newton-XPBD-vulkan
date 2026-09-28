@@ -1,6 +1,6 @@
-// mesh_query_contacts - GPU particle-vs-mesh narrowphase collision query.
-// BVH traversal with distance pruning, closest-point on triangle,
-// and angle-weighted pseudo-normal sign determination.
+// mesh_query_contacts - Particle-vs-mesh narrowphase contact generation.
+// One thread per particle. BVH stack DFS with distance pruning, closest-point-
+// on-triangle, angle-weighted pseudo-normal sign matching Warp mesh query semantics.
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -60,7 +60,7 @@ void closest_point_triangle(vec3 p, vec3 a, vec3 b, vec3 c, out vec3 cp, out vec
         cp = a + (ab * vb + ac * vc) * inv;
         return;
     }
-    // region order + predicates for stable tie-breaking
+    // region order + predicates match Warp intersect.h:44 exactly (tie-breaking!)
     if (d1 <= 0.0 && d2 <= 0.0) { cp = a; return; }
     if (d3 >= 0.0 && d4 <= d3)  { cp = b; return; }
     if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) { cp = a + ab * (d1 / (d1 - d3)); return; }
@@ -86,7 +86,7 @@ void main() {
 
     vec3 p = q[tid].xyz;
     float radius = radii[tid];
-    float max_dist = margin + radius;   
+    float max_dist = margin + radius;   // shape_margin = 0 in scene A
     float max_dist_eps = max_dist + epsilon_min_dist;
 
     // iterative DFS with pruning
@@ -136,7 +136,7 @@ void main() {
                             (lcp*e1n2 - e1cp*e1cp < eps2*e1n2)) weight = PI;
                         else weight = 2.0 * PI;
                     }
-                    // Every triangle within
+                    // Warp mesh_query_point_sign_normal: EVERY triangle within
                     // epsilon of the running min contributes (no near/far split)
                     acc_normal += weight * tn;
                     if (dist < min_dist) { min_dist = dist; best_cp = cp; }

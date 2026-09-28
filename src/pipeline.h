@@ -72,6 +72,13 @@ struct ComputePipeline {
         stage.module = module;
         stage.pName = "main";
 
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT req_subgroup{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+        if (c->supports_subgroup_size_32) {
+            req_subgroup.requiredSubgroupSize = 32;
+            stage.pNext = &req_subgroup;
+        }
+
         VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pci.stage = stage;
         pci.layout = layout;
@@ -89,7 +96,7 @@ struct ComputePipeline {
     }
 };
 
-// Descriptor pool creation for compute pipeline storage buffers
+// one pool + set per pipeline is enough for the harness
 inline VkDescriptorPool make_pool(Context* c, uint32_t max_sets, uint32_t max_storage) {
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_storage};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};

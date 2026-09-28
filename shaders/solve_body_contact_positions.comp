@@ -1,5 +1,6 @@
-// solve_body_contact_positions - Resolves rigid body contact constraints.
-// Accumulates positional and rotational deltas via atomic additions.
+// solve_body_contact_positions - XPBD position-level contact solver for rigid bodies.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::solve_body_contact_positions
+// Accumulates linear and angular delta corrections into per-body buffers.
 #version 450
 #extension GL_EXT_shader_atomic_float : require
 
@@ -40,10 +41,10 @@ layout(push_constant) uniform PC {
 
 const int KINEMATIC = 2; // BodyFlags.KINEMATIC
 
-// --- Helpers ---
+// --- tiny helpers (warp semantics, fp32) ---
 
 vec3 tf_point(vec4 pos, vec4 quat, vec3 p) {
-    // Transform point: rotate then translate
+    // warp transform_point: rotate then translate
     vec3 q = quat.xyz;
     return p + 2.0 * cross(q, cross(q, p) + p * quat.w) + pos.xyz;
 }
@@ -237,7 +238,7 @@ void main() {
     if (mu_torsional > 0.0) {
         float err = dot(delta_omega, n) * pc.dt;
         if (abs(err) > 0.0) {
-            float lin_arr[9]; // zero linear args — pass zero vectors instead
+            float lin_arr[9]; // zero linear args
             float lambda_torsion = compute_contact_constraint_delta(
                 err, quat_a, quat_b, m_inv_a, m_inv_b, I_inv_a, I_inv_b,
                 vec3(0.0), vec3(0.0), -n, n, pc.relaxation, pc.dt);
@@ -264,7 +265,8 @@ void main() {
     if (body_a >= 0) atomic_add_deltas(body_a, lin_delta_a, ang_delta_a);
     if (body_b >= 0) atomic_add_deltas(body_b, lin_delta_b, ang_delta_b);
 
-    // Store contact impulse
+    // contact impulse (first slot for this contact: one write per tid,
+    // but Warp atomic_adds into slot tid; keep identical semantics)
     {
         int base = ci * 6;
         atomicAdd(contact_impulse[base + 0], lin_delta_a.x);

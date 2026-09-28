@@ -1,5 +1,5 @@
-// grid_offsets - Spatial hash grid construction, stage 2.
-// Computes cell starts and cell ends from sorted cell indices.
+// grid_offsets - Computes cell start and end offsets from sorted cell array.
+// Based on warp/native/hashgrid.cu::compute_cell_offsets.
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;

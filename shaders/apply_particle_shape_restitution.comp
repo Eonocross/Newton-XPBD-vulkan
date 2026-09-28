@@ -1,4 +1,5 @@
-// apply_particle_shape_restitution - Resolves normal velocity restitution for particle-shape contacts.
+// apply_particle_shape_restitution - Applies restitution velocity impulses for particle-shape contacts.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::apply_particle_shape_restitution
 #version 450
 #extension GL_EXT_shader_atomic_float : require
 

@@ -1,17 +1,19 @@
-// apply_body_deltas - Applies positional and rotational deltas to rigid bodies.
+// apply_body_deltas - Updates rigid body positions, orientations, and velocities from deltas.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::apply_body_deltas
 //
-// Physics update:
+// Math:
+//   weight = 1 / constraint_inv_weights[tid] (if > 0, else 1)
 //   dp = spatial_top(delta) * (inv_m * weight)
 //   dq = spatial_bottom(delta) * weight
 //   wb = rotate_inv(q0, w0)
 //   dwb = inv_I * rotate_inv(q0, dq)
-//   tb = cross(dwb, I*(wb+dwb)) + cross(wb, I*dwb)  [Coriolis correction]
+//   tb = cross(dwb, I*(wb+dwb)) + cross(wb, I*dwb)
 //   dw1 = rotate(q0, dwb - dt * inv_I * tb)
 //   q1 = normalize(q0 + 0.5 * quat(dw1*dt, 0) * q0)
 //   x_com = p0 + rotate(q0, com)
-//   p1 = x_com + dp*dt;  p1 -= rotate(q1, com)
+//   p1 = x_com + dp*dt - rotate(q1, com)
 //   v1 = v0 + dp;  w1 = w0 + dw1
-
+//   if |v1| < 1e-4: v1 = 0; if |w1| < 1e-4: w1 = 0
 #version 450
 
 layout(local_size_x = 64) in;

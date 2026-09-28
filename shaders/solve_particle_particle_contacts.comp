@@ -1,11 +1,12 @@
-// solve_particle_particle_contacts - Resolves particle-particle contact constraints.
-// Uses spatial hash grid neighbor search to find and resolve pairwise collisions.
+// solve_particle_particle_contacts - Solves particle-particle contact and friction constraints.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::solve_particle_particle_contacts
+// Queries neighbors using uniform spatial hash grid and accumulates delta corrections.
 #version 450
 #extension GL_EXT_shader_atomic_float : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// Hash grid dimensions (128x128x128)
+// grid constants (Warp: wp.HashGrid(128,128,128), origin offset 1<<20)
 #define GRID_DIM 128
 #define GRID_ORIGIN (1 << 20)
 
@@ -114,7 +115,7 @@ void main() {
 
     int pflag = flags_arr[i];
     if ((pflag & 1) == 0) return;             // ACTIVE
-    int is_proxy = pflag & 2;                 // PROXY flag check
+    int is_proxy = pflag & 2;                 // PROXY (as int, Warp semantics)
 
     vec3 x = x_arr[i].xyz;
     vec3 v = v_arr[i].xyz;

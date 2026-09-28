@@ -1,15 +1,12 @@
-// apply_particle_deltas - Applies positional deltas to particles and computes velocities.
+// apply_particle_deltas - Updates particle positions and velocities from accumulated deltas.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::apply_particle_deltas
 //
-// Update logic:
+// Math:
 //   if (flags & ACTIVE) == 0: return
 //   x_new = x_pred + delta
 //   v_new = (x_new - x_orig) / dt
 //   if |v_new| > v_max: v_new *= v_max/|v_new|; x_new = x_orig + v_new*dt
 //   x_out = x_new; v_out = v_new
-//
-// Notes:
-//   - x_orig is the pre-integration state. Velocity is derived from the total
-//     positional change across the substep.
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;

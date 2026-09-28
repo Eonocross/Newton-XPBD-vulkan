@@ -1,6 +1,6 @@
-// solve_particle_shape_contacts - Resolves particle-shape contact constraints.
-// Computes normal corrections and friction deltas, accumulating into
-// particle deltas and body deltas.
+// solve_particle_shape_contacts - Solves particle-vs-shape contact and friction constraints.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::solve_particle_shape_contacts
+// One thread per contact slot, accumulating delta corrections into particle and body buffers.
 #version 450
 #extension GL_EXT_shader_atomic_float : require
 
@@ -12,13 +12,13 @@ layout(std430, binding = 2) readonly buffer ParticleInvMass { float particle_inv
 layout(std430, binding = 3) readonly buffer ParticleRadius { float particle_radius[]; };
 layout(std430, binding = 4) readonly buffer ParticleFlags { int particle_flags[]; };
 // body_q: per-body stride 8 floats = 2 x vec4: slot0.xyz = position,
-// slot1 = quaternion (qx,qy,qz,qw). (Transform = [px,py,pz,qx,qy,qz,qw].)
+// slot1 = quaternion (qx,qy,qz,qw). (Warp transform = [px,py,pz,qx,qy,qz,qw].)
 layout(std430, binding = 5) readonly buffer BodyQ { vec4 body_q[]; };
 // body_qd: per-body stride 8 floats = 2 x vec4: slot0.xyz = linear (top),
 // slot1.xyz = angular (bottom).
 layout(std430, binding = 6) readonly buffer BodyQd { vec4 body_qd[]; };
 layout(std430, binding = 7) readonly buffer BodyCom { float body_com[]; };  // 3 floats/body (tight)
-// body_inv_inertia: tightly packed 9 floats per body
+// body_inv_inertia: Warp mat33 = tightly packed 9 floats per body (row-major)
 layout(std430, binding = 8) readonly buffer BodyInvInertia { float body_inv_I[]; };
 layout(std430, binding = 9) readonly buffer BodyInvMass { float body_inv_m[]; };
 layout(std430, binding = 10) readonly buffer BodyFlags { int body_flags[]; };
@@ -75,17 +75,17 @@ vec3 exact_div(vec3 v, float d) {
     return fma(rem, vec3(inv_d), q);
 }
 
+float exact_sqrt(float a) {
+    float d = sqrt(a);
+    float r = fma(-d, d, a);
+    return fma(r, 0.5 / d, d);
+}
+
 float exact_length(vec3 v) {
     precise float l2 = v.y * v.y;
     l2 = fma(v.x, v.x, l2);
     l2 = fma(v.z, v.z, l2);
-    if (l2 <= 0.0) return 0.0;
-    precise float rsq = inversesqrt(l2);
-    precise float y0 = l2 * rsq;
-    precise float h0 = 0.5 * rsq;
-    precise float err = fma(-y0, y0, l2);
-    precise float vt_len = fma(err, h0, y0);
-    return vt_len;
+    return exact_sqrt(l2);
 }
 
 void main() {

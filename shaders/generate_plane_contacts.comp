@@ -1,6 +1,6 @@
-// generate_plane_contacts - GPU analytic plane-contact generation.
-// Generates contacts against the ground plane (z = altitude):
-//   contact iff pz < soft_margin + radius
+// generate_plane_contacts - Analytic contact generation between particles and infinite ground plane.
+// Generates contacts for active particles penetrating ground plane:
+//   contact iff pz < soft_margin + radius (infinite plane z=altitude, +Z normal)
 //   body_pos = (px, py, altitude), body_vel = 0, normal = (0,0,1), shape = 0
 #version 450
 #extension GL_EXT_shader_atomic_float : require
@@ -19,7 +19,7 @@ layout(std430, binding = 8) writeonly buffer ContactNormal { float contact_norma
 
 layout(push_constant) uniform PC {
     float soft_margin;   // CollisionPipeline default 0.01
-    float altitude;      // ground_plane_altitude
+    float altitude;      // ground plane altitude
     uint contact_max;
     float pad0;
 } pc;

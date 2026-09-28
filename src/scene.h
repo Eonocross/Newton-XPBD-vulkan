@@ -32,6 +32,7 @@ struct SolverConfig {
     float gravity[3] = {0.0f, 0.0f, -9.81f};
     std::string shader_dir = "shaders";
     int device_index = -1;
+    bool compat_mode = false;
     bool enable_validation = false;
     bool enable_diagnostics = false;
     uint32_t max_diag_pairs = 100000;
@@ -116,7 +117,8 @@ public:
     std::vector<GPUPairRecord> get_diag_pairs();
     void reset_diag_buffers();
 
-    // Shape-contact diagnostic readback (32 uints)
+    // Persistent P11 shape-contact diagnostic readback (32 uints)
+    // slot[0] = sentinel (0xDEAD0001 when written), [1..31] = raw float bits
     std::vector<uint32_t> get_p11_diag();
     std::vector<uint32_t> get_p11_apply_diag();
     std::vector<float> get_shape_contact_diag();
@@ -156,9 +158,9 @@ private:
     Buffer m_vtx, m_idx, m_nl, m_nu, m_meta, m_prim, m_params, m_vvel;
     Buffer g_cells, g_ids;
     Buffer b_diag_header, b_diag_pairs;
-    Buffer b_p11_diag;        // shape-contact diagnostic buffer
-    Buffer b_p11_apply_diag;  // apply_particle_deltas diagnostic buffer
-    Buffer b_mesh_diag;       // mesh candidate diagnostic buffer
+    Buffer b_p11_diag;        // persistent 32-uint P11 shape-contact diagnostic
+    Buffer b_p11_apply_diag;  // persistent 32-uint P11 apply_particle_deltas diagnostic
+    Buffer b_mesh_diag;       // persistent 32-uint mesh candidate diagnostic
 
     // Sorter
     GpuSort m_sorter;

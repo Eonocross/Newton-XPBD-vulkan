@@ -48,7 +48,7 @@ void XpbdSolver::init(const SolverConfig& config, size_t num_particles, size_t m
     m_n_parts = num_particles;
     m_contact_max = max_contacts ? max_contacts : (num_particles * 2);
 
-    m_ctx.init(m_config.enable_validation, m_config.device_index);
+    m_ctx.init(m_config.enable_validation, m_config.device_index, m_config.compat_mode);
 
     // Create particle & state buffers
     b_q.create(&m_ctx, m_n_parts * 4 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -110,7 +110,7 @@ void XpbdSolver::init(const SolverConfig& config, size_t num_particles, size_t m
 
 
 
-    m_pool = make_pool(&m_ctx, 32, 128);
+    m_pool = make_pool(&m_ctx, 64, 256);
     m_pool_guard = std::make_unique<PoolGuard>(&m_ctx, m_pool);
 
     m_sorter.create(&m_ctx, m_n_parts, m_pool, *m_pool_guard, m_config.shader_dir);
@@ -701,7 +701,7 @@ void XpbdSolver::step(float dt, int substeps, int iterations) {
             }
         }
 
-        // Restitution phase: applies particle-shape velocity restitution
+        // Restitution phase (mirrors Warp's apply_particle_shape_restitution after iterations)
         if (m_config.enable_restitution && m_contact_count > 0) {
             cmd_dispatch(sh_rest.pipeline, sh_rest.layout, set_rest, &pc_rest, sizeof(PCRest),
                          (uint32_t)((m_contact_count + 63) / 64));

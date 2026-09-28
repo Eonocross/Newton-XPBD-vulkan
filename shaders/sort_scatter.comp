@@ -1,10 +1,5 @@
-// sort_scatter — GPU radix sort pass C: scatter elements to their sorted
-// position for this digit.
-// Slot = per-WG scatter base (global_hist[wg*256+digit], written by the scan
-// shader) + STABLE rank of this element among same-digit elements of this
-// workgroup. Rank is computed deterministically by counting same-digit
-// predecessors in the tile (shared memory) — ascending tile-index order, so
-// ties keep global ascending index order: the sort is stable.
+// sort_scatter - GPU radix sort pass C: scatter elements to sorted positions.
+// Computes stable rank of each element within workgroup tile and scatters to global buffer.
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;

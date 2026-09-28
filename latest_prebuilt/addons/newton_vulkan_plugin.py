@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Newton Vulkan Direct Physics",
     "author": "Eonocross",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Newton",
     "description": "Bit-exact Vulkan compute backend for Newton XPBD physics simulation in Blender",
@@ -46,7 +46,7 @@ except ImportError as e:
 
 @persistent
 def load_npy_frame_vk(scene):
-    if not hasattr(scene, "newton_vk_settings") or not scene.newton_vk_settings.disk_cache:
+    if not hasattr(scene, "newton_vk_settings"):
         return
     
     frame = scene.frame_current
@@ -72,13 +72,16 @@ class NEWTONVK_PG_settings(bpy.types.PropertyGroup):
     frames: bpy.props.IntProperty(name="Frames", default=100, min=1)
     grid_size: bpy.props.FloatVectorProperty(name="Grid Size", default=(2.0, 2.0, 2.0))
     grid_pos: bpy.props.FloatVectorProperty(name="Grid Pos", default=(0.0, 0.0, 3.0))
-    disk_cache: bpy.props.BoolProperty(name="Use Disk Cache", description="Stream particles to lightweight .npy files", default=True)
+    sim_fps: bpy.props.FloatProperty(name="Simulation FPS", default=60.0, min=1.0, description="Physics frame rate (dt = 1.0 / sim_fps)")
     colliders: bpy.props.CollectionProperty(type=NEWTONVK_PG_colliderItem)
     
     # Particle Settings
     part_mass: bpy.props.FloatProperty(name="Mass", default=0.1, min=0.001)
     part_radius_std: bpy.props.FloatProperty(name="Radius Variance", default=0.0, min=0.0)
     part_jitter: bpy.props.FloatProperty(name="Jitter", default=0.01, min=0.0)
+    part_mu: bpy.props.FloatProperty(name="Particle Friction", default=0.5, min=0.0, description="Inter-particle Coulomb friction coefficient")
+    part_cohesion: bpy.props.FloatProperty(name="Cohesion", default=0.0, min=0.0, description="Attractive cohesion distance between particles (e.g. wet sand / sticky cluster)")
+    part_adhesion: bpy.props.FloatProperty(name="Adhesion", default=0.0, min=0.0, description="Attractive adhesion distance between particles and collider meshes")
     part_vel: bpy.props.FloatVectorProperty(name="Initial Velocity", default=(0.0, 0.0, -1.0))
     part_vel_random: bpy.props.BoolProperty(name="Randomize Initial Velocity", description="Add deterministic uniform random perturbation to initial velocity", default=False)
     part_vel_seed: bpy.props.IntProperty(name="Velocity Seed", description="RNG seed for deterministic velocity generation", default=42)
@@ -88,19 +91,13 @@ class NEWTONVK_PG_settings(bpy.types.PropertyGroup):
     col_mu: bpy.props.FloatProperty(name="Friction", default=1.0, min=0.0)
     col_restitution: bpy.props.FloatProperty(name="Bounciness", default=0.0, min=0.0, max=1.0)
     col_margin: bpy.props.FloatProperty(name="Collision Margin", default=0.0, min=0.0)
-    col_mu_rolling: bpy.props.FloatProperty(name="Rolling Friction", default=0.0001, min=0.0)
-    col_mu_torsional: bpy.props.FloatProperty(name="Torsional Friction", default=0.005, min=0.0)
     
     # Solver Settings (SolverXPBD)
     solver_iterations: bpy.props.IntProperty(name="Iterations", default=2, min=1)
     solver_rigid_contact_relax: bpy.props.FloatProperty(name="Contact Relaxation", default=0.8, min=0.0, max=1.0)
-    solver_angular_damping: bpy.props.FloatProperty(name="Angular Damping", default=0.0, min=0.0)
     solver_enable_restitution: bpy.props.BoolProperty(name="Enable Bounciness", default=False)
-    
-    # Substep / Collider interpolation settings
     substeps: bpy.props.IntProperty(name="Substeps / Frame", description="Main physics substeps per rendered frame", default=10, min=1, max=100)
-    collider_follows_main_substeps: bpy.props.BoolProperty(name="Collider Follows Main Substeps", description="If enabled, collider updates every main substep; if disabled, use custom collider substeps below", default=True)
-    collider_substeps: bpy.props.IntProperty(name="Collider Substeps / Frame", description="Custom collider interpolation substeps when not following main substeps", default=1, min=1, max=100)
+    gravity: bpy.props.FloatVectorProperty(name="Gravity", default=(0.0, 0.0, -9.81), description="Gravity vector (m/s^2)")
 
     # Ground plane settings
     has_ground_plane: bpy.props.BoolProperty(name="Enable Ground Plane", description="Infinite ground plane at Z=ground_plane_altitude", default=True)
@@ -122,6 +119,12 @@ class NEWTONVK_PG_settings(bpy.types.PropertyGroup):
         name="GPU Device",
         description="Select which Vulkan physical device to use for simulation",
         items=get_vulkan_devices
+    )
+
+    compat_mode: bpy.props.BoolProperty(
+        name="Compatibility Mode",
+        description="Enable emulation for GPUs lacking native float atomicAdd support",
+        default=False
     )
 
     # Logging settings
@@ -155,13 +158,14 @@ class NEWTONVK_PT_panel(bpy.types.Panel):
         box_dev = layout.box()
         box_dev.label(text="Hardware & Output:", icon='PREFERENCES')
         box_dev.prop(vk_props, "device_choice", text="GPU")
-        box_dev.prop(vk_props, "disk_cache")
+        box_dev.prop(vk_props, "compat_mode")
         box_dev.prop(vk_props, "log_level")
         
         box_grid = layout.box()
-        box_grid.label(text="Grid Layout:")
+        box_grid.label(text="Grid Layout & Time:")
         box_grid.prop(vk_props, "particle_count")
         box_grid.prop(vk_props, "frames")
+        box_grid.prop(vk_props, "sim_fps")
         box_grid.prop(vk_props, "grid_size")
         box_grid.prop(vk_props, "grid_pos")
         
@@ -170,6 +174,9 @@ class NEWTONVK_PT_panel(bpy.types.Panel):
         box_part.prop(vk_props, "part_mass")
         box_part.prop(vk_props, "part_radius_std")
         box_part.prop(vk_props, "part_jitter")
+        box_part.prop(vk_props, "part_mu")
+        box_part.prop(vk_props, "part_cohesion")
+        box_part.prop(vk_props, "part_adhesion")
         box_part.prop(vk_props, "part_vel")
         box_part.prop(vk_props, "part_vel_random")
         if vk_props.part_vel_random:
@@ -181,8 +188,6 @@ class NEWTONVK_PT_panel(bpy.types.Panel):
         box_col.prop(vk_props, "col_mu")
         box_col.prop(vk_props, "col_restitution")
         box_col.prop(vk_props, "col_margin")
-        box_col.prop(vk_props, "col_mu_rolling")
-        box_col.prop(vk_props, "col_mu_torsional")
         
         box_col_list = box_col.box()
         box_col_list.label(text="Collider Objects (Empty = All):")
@@ -199,19 +204,13 @@ class NEWTONVK_PT_panel(bpy.types.Panel):
         box_solver.label(text="Solver Settings:")
         box_solver.prop(vk_props, "solver_iterations")
         box_solver.prop(vk_props, "solver_rigid_contact_relax")
-        box_solver.prop(vk_props, "solver_angular_damping")
         box_solver.prop(vk_props, "solver_enable_restitution")
+        box_solver.prop(vk_props, "substeps")
+        box_solver.prop(vk_props, "gravity")
         box_solver.separator()
         box_solver.prop(vk_props, "has_ground_plane")
         if vk_props.has_ground_plane:
             box_solver.prop(vk_props, "ground_plane_altitude")
-        
-        box_sub = layout.box()
-        box_sub.label(text="Substeps / Collider Interpolation:")
-        box_sub.prop(vk_props, "substeps")
-        box_sub.prop(vk_props, "collider_follows_main_substeps")
-        if not vk_props.collider_follows_main_substeps:
-            box_sub.prop(vk_props, "collider_substeps")
         
         layout.separator()
         layout.operator("newton_vk.simulate", icon='PLAY')
@@ -353,6 +352,8 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
         py = np.arange(dim_y) * spacing
         pz = np.arange(dim_z) * spacing
         points = np.stack(np.meshgrid(px, py, pz)).reshape(3, -1).T
+        grid_extent = np.array([dim_x - 1, dim_y - 1, dim_z - 1], dtype=np.float32) * spacing
+        points -= grid_extent * 0.5
         points += np.array(props.grid_pos)
 
         rng = np.random.default_rng(42)
@@ -392,28 +393,35 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
 
         # 3. Configure Vulkan Solver
         cfg = vkxpbd.SolverConfig()
-        fps = 60.0
+        fps = float(props.sim_fps)
         dt = 1.0 / fps
         cfg.dt = dt
         cfg.substeps = props.substeps
         cfg.iterations = props.solver_iterations
-        cfg.soft_contact_mu = 0.5
+        cfg.soft_contact_mu = props.part_mu
         cfg.shape_material_mu = props.col_mu
-        cfg.soft_contact_relaxation = 0.9
+        cfg.soft_contact_relaxation = props.solver_rigid_contact_relax
         cfg.soft_contact_margin = 0.01 + props.col_margin
         cfg.enable_restitution = props.solver_enable_restitution
         cfg.soft_contact_restitution = props.col_restitution
+        cfg.particle_cohesion = props.part_cohesion
+        cfg.particle_adhesion = props.part_adhesion
         cfg.particle_max_radius = float(np.max(radii))
-        cfg.search_radius = 2.0 * cfg.particle_max_radius
+        cfg.search_radius = 2.0 * cfg.particle_max_radius + cfg.particle_cohesion
         cfg.has_ground_plane = props.has_ground_plane
         cfg.ground_plane_altitude = props.ground_plane_altitude
+        cfg.gravity = [props.gravity[0], props.gravity[1], props.gravity[2]]
 
         log_lvl = getattr(props, "log_level", "MINIMAL")
 
-        # Set shader directory path located in addons/modules/vkxpbd_shaders
-        shader_dir = os.path.join(addon_dir, "modules", "vkxpbd_shaders")
+        compat_enabled = getattr(props, "compat_mode", False)
+        cfg.compat_mode = compat_enabled
+
+        # Set shader directory path located in addons/modules
+        shader_subdir = "vkxpbd_shaders_compat" if compat_enabled else "vkxpbd_shaders"
+        shader_dir = os.path.join(addon_dir, "modules", shader_subdir)
         if not os.path.exists(shader_dir):
-            shader_dir = os.path.join(addon_dir, "shaders")
+            shader_dir = os.path.join(addon_dir, shader_subdir if compat_enabled else "shaders")
         cfg.shader_dir = shader_dir
         # Device selection
         try:
@@ -495,14 +503,16 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 "friction_mu": props.col_mu,
                 "contact_margin": props.col_margin,
                 "contact_relaxation": props.solver_rigid_contact_relax,
-                "soft_contact_relaxation": 0.9,
+                "soft_contact_relaxation": props.solver_rigid_contact_relax,
                 "soft_contact_margin": 0.01 + props.col_margin,
-                "particle_soft_mu": 0.5,
+                "particle_soft_mu": float(props.part_mu),
                 "shape_material_mu": props.col_mu,
-                "search_radius": float(2.0 * np.max(radii)),
+                "particle_cohesion": float(props.part_cohesion),
+                "particle_adhesion": float(props.part_adhesion),
+                "search_radius": float(2.0 * np.max(radii) + props.part_cohesion),
                 "enable_restitution": props.solver_enable_restitution,
                 "restitution": props.col_restitution if props.solver_enable_restitution else 0.0,
-                "angular_damping": props.solver_angular_damping,
+                "gravity": list(props.gravity),
                 "has_ground_plane": props.has_ground_plane,
                 "ground_plane_altitude": props.ground_plane_altitude,
                 "collider_count": len(collected_meshes),
@@ -520,12 +530,13 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 f_log.write(f"Initial Velocity: Base={list(props.part_vel)}, Random={props.part_vel_random} (seed={props.part_vel_seed}, range={props.part_vel_random_range})\n")
                 f_log.write(f"                  Speed: mean={np.mean(v_speeds):.4f} m/s, max={np.max(v_speeds):.4f} m/s\n")
                 f_log.write(f"Solver Config:    dt={dt:.4f}s, substeps={props.substeps}, iterations={props.solver_iterations}\n")
-                f_log.write(f"Soft Contact:     particle_soft_mu=0.5, shape_mu={props.col_mu}, soft_relax=0.9, rigid_relax={props.solver_rigid_contact_relax}\n")
-                f_log.write(f"                  soft_margin={0.01 + props.col_margin:.4f}, search_radius={2.0 * np.max(radii):.4f}\n")
+                f_log.write(f"Contact Params:   particle_mu={props.part_mu}, shape_mu={props.col_mu}, cohesion={props.part_cohesion}, adhesion={props.part_adhesion}\n")
+                f_log.write(f"                  soft_relax={props.solver_rigid_contact_relax}, soft_margin={0.01 + props.col_margin:.4f}, search_radius={2.0 * np.max(radii) + props.part_cohesion:.4f}\n")
+                f_log.write(f"Gravity:          {list(props.gravity)}\n")
                 f_log.write(f"Restitution:      enabled={props.solver_enable_restitution}, e={props.col_restitution if props.solver_enable_restitution else 0.0}\n")
                 f_log.write(f"Ground Plane:     enabled={props.has_ground_plane}, alt={props.ground_plane_altitude}\n")
                 f_log.write("="*80 + "\n\n")
-                f_log.write(f"{'Frame':<6} | {'Physics (ms)':<13} | {'Disk IO (ms)':<13} | {'Total (ms)':<11} | {'Contacts':<9} | {'Min Z (m)':<10}\n")
+                f_log.write(f"{'Frame':<6} | {'Physics (ms)':<13} | {'Disk IO (ms)':<13} | {'Total (ms)':<11} | {'Contacts':<9} | {'Min Z (m)':<10} | {'Max Spd (m/s)'}\n")
                 f_log.write("-" * 80 + "\n")
 
         if log_lvl == 'VERBOSE':
@@ -539,6 +550,8 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
         init_io_ms = (time.perf_counter() - t_io0) * 1000.0
 
         if log_lvl == 'VERBOSE':
+            v_init = solver.get_velocities()
+            speeds_init = np.linalg.norm(v_init, axis=1)
             frame_0_rec = {
                 "type": "frame",
                 "frame": 0,
@@ -548,14 +561,16 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 "frame_ms": round(init_io_ms, 2),
                 "contacts": 0,
                 "min_z": round(float(np.min(pos_init[:, 2])), 4),
-                "max_z": round(float(np.max(pos_init[:, 2])), 4)
+                "max_z": round(float(np.max(pos_init[:, 2])), 4),
+                "mean_speed": round(float(np.mean(speeds_init)), 4),
+                "max_speed": round(float(np.max(speeds_init)), 4)
             }
             with open(jsonl_path, "a", encoding="utf-8") as f_j:
                 f_j.write(json.dumps(frame_0_rec) + "\n")
 
         if log_lvl in ('STANDARD', 'VERBOSE'):
             with open(log_path, "a", encoding="utf-8") as f_log:
-                f_log.write(f"{0:<6d} | {0.0:<13.2f} | {init_io_ms:<13.2f} | {init_io_ms:<11.2f} | {0:<9d} | {float(np.min(pos_init[:, 2])):<10.4f}\n")
+                f_log.write(f"{0:<6d} | {0.0:<13.2f} | {init_io_ms:<13.2f} | {init_io_ms:<11.2f} | {0:<9d} | {float(np.min(pos_init[:, 2])):<10.4f} | 0.0000\n")
 
         if log_lvl == 'MINIMAL':
             print(f"[Newton Vulkan] Starting simulation ({props.frames} frames, {props.substeps} substeps/frame, Log Level: MINIMAL)...", flush=True)
@@ -607,8 +622,8 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 contact_counts.append(cnt)
                 min_z = float(np.min(pos[:, 2]))
                 with open(log_path, "a", encoding="utf-8") as f_log:
-                    f_log.write(f"{frame:<6d} | {t_phys:<13.2f} | {t_io:<13.2f} | {total_frame_t:<11.2f} | {cnt:<9d} | {min_z:<10.4f}\n")
-                print(f"[Vulkan] Frame {frame:3d}/{props.frames} | step={t_phys:6.2f} ms | io={t_io:5.2f} ms | total={elapsed_total:5.2f} s | mesh_contacts={cnt}", flush=True)
+                    f_log.write(f"{frame:<6d} | {t_phys:<13.2f} | {t_io:<13.2f} | {total_frame_t:<11.2f} | {cnt:<9d} | {min_z:<10.4f} | -\n")
+                print(f"[Vulkan] Frame {frame:3d}/{props.frames} | phys={t_phys:6.2f} ms | io={t_io:5.2f} ms | total={elapsed_total:5.2f} s | mesh_contacts={cnt}", flush=True)
 
             elif log_lvl == 'VERBOSE':
                 cnt = solver.last_contact_count
@@ -618,6 +633,10 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 contact_counts.append(cnt)
                 min_z = float(np.min(pos[:, 2]))
                 max_z = float(np.max(pos[:, 2]))
+                v_curr = solver.get_velocities()
+                speeds = np.linalg.norm(v_curr, axis=1)
+                mean_spd = float(np.mean(speeds))
+                max_spd = float(np.max(speeds))
 
                 frame_rec = {
                     "type": "frame",
@@ -629,15 +648,17 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                     "contacts": cnt,
                     "pp_interactions": pp_cnt,
                     "min_z": round(min_z, 4),
-                    "max_z": round(max_z, 4)
+                    "max_z": round(max_z, 4),
+                    "mean_speed": round(mean_spd, 4),
+                    "max_speed": round(max_spd, 4)
                 }
                 with open(jsonl_path, "a", encoding="utf-8") as f_j:
                     f_j.write(json.dumps(frame_rec) + "\n")
 
                 with open(log_path, "a", encoding="utf-8") as f_log:
-                    f_log.write(f"{frame:<6d} | {t_phys:<13.2f} | {t_io:<13.2f} | {total_frame_t:<11.2f} | {cnt:<9d} | {min_z:<10.4f}\n")
+                    f_log.write(f"{frame:<6d} | {t_phys:<13.2f} | {t_io:<13.2f} | {total_frame_t:<11.2f} | {cnt:<9d} | {min_z:<10.4f} | {max_spd:.4f}\n")
 
-                print(f"[Vulkan] Frame {frame:3d}/{props.frames} | step={t_phys:6.2f} ms | io={t_io:5.2f} ms | frame={total_frame_t:6.2f} ms | total={elapsed_total:5.2f} s | mesh_contacts={cnt} | pp_interactions={pp_cnt}", flush=True)
+                print(f"[Vulkan] Frame {frame:3d}/{props.frames} | phys={t_phys:6.2f} ms | io={t_io:5.2f} ms | frame={total_frame_t:6.2f} ms | total={elapsed_total:5.2f} s | mesh_contacts={cnt} | pp_interactions={pp_cnt}", flush=True)
 
         total_wall_s = time.perf_counter() - sim_start_time
         avg_phys = float(np.mean(physics_times))

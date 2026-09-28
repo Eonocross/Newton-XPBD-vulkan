@@ -1,8 +1,6 @@
-// sort_histogram — GPU radix sort pass A: 8-bit digit histogram.
-// Each workgroup (256 threads) processes a 256-element tile of the key array
-// and adds its 256-bin digit histogram to global_hist[workgroup*256 + bin].
-// Binding 2 (scanned) is zeroed here by thread 0 of workgroup 0 so the scan
-// stage can run in-place without a separate fill.
+// sort_histogram - GPU radix sort pass A: 8-bit digit histogram.
+// Each workgroup processes a 256-element tile of the key array and adds
+// its 256-bin digit histogram to global_hist.
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -24,7 +22,7 @@ shared uint local_hist[256];
 void main() {
     uint tid = gl_GlobalInvocationID.x;
 
-    // zero scanned once per pass (thread 0 of WG 0) — the scan shader writes
+    // zero scanned once per pass (thread 0 of WG 0) - the scan shader writes
     // it, so it must start clean every pass
     if (gl_WorkGroupID.x == 0 && gl_LocalInvocationID.x < 256) {
         scanned[gl_LocalInvocationID.x] = 0;
@@ -44,7 +42,7 @@ void main() {
     barrier();
     memoryBarrierShared();
 
-    // write (not +=) this workgroup's histogram — global_hist is zeroed by a
+    // write (not +=) this workgroup's histogram - global_hist is zeroed by a
     // vkCmdFillBuffer before each pass, so += vs = is equivalent but = is
     // race-free against stale data
     global_hist[gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x] = local_hist[gl_LocalInvocationID.x];

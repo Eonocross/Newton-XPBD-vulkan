@@ -1,6 +1,6 @@
-// grid_cell_indices - Spatial hash grid construction, stage 1.
-// Computes cell indices for particles based on spatial position:
-// point_cells[i] = cell(particle i), point_ids[i] = i.
+// grid_cell_indices - Computes hash grid cell index for each particle.
+// Based on warp/native/hashgrid.cu::compute_cell_indices.
+// One thread per particle: point_cells[i] = cell(particle i), point_ids[i] = i.
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -15,7 +15,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 uint hash_grid_index(vec3 p) {
-    // Compute grid cell index with origin offset:
+    // host/warp order: floor(p*inv) FIRST, then add origin, then clamp
     ivec3 g = ivec3(floor(p * pc.cell_width_inv));
     g = g + (1 << 20);
     g = max(g, ivec3(0)); // clamp (guard region)

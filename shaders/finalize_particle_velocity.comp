@@ -1,6 +1,9 @@
-// finalize_particle_velocity - Derives particle velocity from substep positional change:
+// finalize_particle_velocity - Derives end-of-step particle velocity from displacement.
+// Based on newton/newton/_src/solvers/xpbd/kernels.py::apply_particle_deltas
+//
+// Math:
 //   v_new = (x_new - x0) / dt
-//   clamp |v_new| to v_max; if clamped: x_new = x0 + v_new*dt
+//   if |v_new| > v_max: v_new *= v_max / |v_new|; x_new = x0 + v_new * dt
 #version 450
 
 layout(local_size_x = 64) in;

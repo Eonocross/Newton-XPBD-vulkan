@@ -1,11 +1,17 @@
-// integrate_bodies - Rigid body time integration.
+// integrate_bodies - Forward Euler / symplectic integration for rigid bodies.
+// Based on newton/newton/_src/solvers/solver.py::integrate_bodies
 //
-// Rigid body integration:
-//   Linear: v1 = v0 + (f0 * inv_mass + gravity) * dt; x1 = x_com + v1 * dt
-//   Angular: wb = rotate_inv(r0, w0); tb = rotate_inv(r0, t0) - cross(wb, I*wb)
-//            w1 = rotate(r0, wb + inv_I * tb * dt)
-//            r1 = normalize(r0 + quat(w1, 0) * r0 * 0.5 * dt)
-//            w1 *= 1.0 - angular_damping * dt
+// Math:
+//   x_com = x0 + rotate(r0, com)
+//   v1 = v0 + (f0 * inv_mass + gravity * (inv_mass != 0)) * dt
+//   x1 = x_com + v1 * dt
+//   wb = rotate_inv(r0, w0)
+//   tb = rotate_inv(r0, t0) - cross(wb, inertia * wb)
+//   w1 = rotate(r0, wb + inv_inertia * tb * dt)
+//   r1 = normalize(r0 + quat(w1, 0) * r0 * 0.5 * dt)
+//   w1 *= 1.0 - angular_damping * dt
+//   q_new = transform(x1 - rotate(r1, com), r1)
+//   qd_new = spatial_vector(v1, w1)
 #version 450
 
 layout(local_size_x = 64) in;
@@ -47,16 +53,16 @@ vec3 inertia_mul_f(const float m[9], vec3 v) {
     return inertia_col(m, 0) * v.x + inertia_col(m, 1) * v.y + inertia_col(m, 2) * v.z;
 }
 
-// Hamilton product p*q (quaternion multiplication)
+// Hamilton product p*q (warp quat multiply convention)
 vec4 quat_mul(vec4 p, vec4 q) {
-    // (w1,w2) (xyz1,xyz2): w = w1*w2 - dot(xyz1,xyz2); xyz = w1*xyz2 + w2*xyz1 + cross(xyz1,xyz2)
+    // warp: (w1,w2) (xyz1,xyz2): w = w1*w2 - dot(xyz1,xyz2); xyz = w1*xyz2 + w2*xyz1 + cross(xyz1,xyz2)
     float w = p.w * q.w - dot(p.xyz, q.xyz);
     vec3 xyz = p.w * q.xyz + q.w * p.xyz + cross(p.xyz, q.xyz);
     return vec4(xyz, w);
 }
 
 vec3 quat_rotate(vec4 q, vec3 v) {
-    // rotate: v + 2*cross(q.xyz, cross(q.xyz, v) + v*q.w)
+    // warp: v + 2*cross(q.xyz, cross(q.xyz, v) + v*q.w)
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + v * q.w);
 }
 
@@ -93,7 +99,7 @@ void main() {
 
     vec3 x_com = x0 + quat_rotate(r0, com);
 
-    float m_scale = inv_mass != 0.0 ? 1.0 : 0.0;   // Nonzero mass check
+    float m_scale = inv_mass != 0.0 ? 1.0 : 0.0;   // wp.nonzero
     vec3 v1 = v0 + (f0 * inv_mass + world_g * m_scale) * pc.dt;
     vec3 x1 = x_com + v1 * pc.dt;
 
