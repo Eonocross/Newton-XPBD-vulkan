@@ -21,7 +21,7 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 ### Blender Plugin
 
-[Download Plugin ZIP](https://github.com/Eonocross/Newton-XPBD-vulkan/releases) (`newton_vulkan_plugin.py`)
+[Download Latest Plugin ZIP](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/plugin-v1.1.0) (`newton_vulkan_plugin.py`)
 
 ---
 
