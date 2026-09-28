@@ -7,7 +7,7 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 | Hardware | Status | Latest Binaries Download Link |
 | :--- | :---: | :--- |
-| **NVIDIA** | **Effectively Bit-exact** | [Windows x64 / Linux x86_64](https://github.com/Eonocross/Newton-XPBD-vulkan/releases) |
+| **NVIDIA** | **Effectively Bit-exact** | [Windows x64 / Linux x86_64](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.4.0) |
 | **AMD (discrete)**  | **Untested** | *Should use standard Windows / Linux binaries* |
 | **AMD (integrated)** | **Untested** | *Should use standard Windows / Linux binaries* |
 | **Intel UHD / Iris Xe** | **Compat\*** | *Should use standard Windows / Linux binaries* |
