@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Newton Vulkan Direct Physics",
     "author": "Eonocross",
-    "version": (1, 1),
+    "version": (1, 2, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Newton",
     "description": "Bit-exact Vulkan compute backend for Newton XPBD physics simulation in Blender",
@@ -329,10 +329,16 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
                 T = mat[:3, 3]
                 world_verts = (np.dot(verts, R.T) + T).astype(np.float32)
 
+                # Extract rotation quaternion (xyzw) from matrix_world for normal computation.
+                # This lets the Vulkan shader replicate Warp's local-space normalize path exactly.
+                q = obj.matrix_world.to_quaternion()  # Blender returns wxyz
+                shape_rot = np.array([q.x, q.y, q.z, q.w], dtype=np.float32)  # convert to xyzw
+
                 collected_meshes.append({
                     "name": obj.name,
                     "verts": world_verts.flatten(),
-                    "indices": indices
+                    "indices": indices,
+                    "shape_rot": shape_rot,
                 })
                 eval_obj.to_mesh_clear()
                 print(f"[Newton Vulkan] Synced collider mesh: {obj.name} ({len(world_verts)} verts, {len(indices)//3} tris)")
@@ -399,6 +405,7 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
         cfg.substeps = props.substeps
         cfg.iterations = props.solver_iterations
         cfg.soft_contact_mu = props.part_mu
+        cfg.particle_mu = props.part_mu
         cfg.shape_material_mu = props.col_mu
         cfg.soft_contact_relaxation = props.solver_rigid_contact_relax
         cfg.soft_contact_margin = 0.01 + props.col_margin
@@ -441,7 +448,8 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
         solver.init(cfg, n_particles, max_contacts)
 
         for m in collected_meshes:
-            solver.add_mesh(m["verts"], m["indices"])
+            rot = m.get("shape_rot")
+            solver.add_mesh(m["verts"], m["indices"], shape_rot=rot)
         solver.finalize_meshes()
 
         solver.set_particles(

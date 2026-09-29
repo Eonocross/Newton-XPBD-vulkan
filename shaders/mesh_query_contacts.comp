@@ -60,7 +60,7 @@ void closest_point_triangle(vec3 p, vec3 a, vec3 b, vec3 c, out vec3 cp, out vec
         cp = a + (ab * vb + ac * vc) * inv;
         return;
     }
-    // region order + predicates match Warp intersect.h:44 exactly (tie-breaking!)
+    // Region tests in canonical evaluation order for tie-breaking:
     if (d1 <= 0.0 && d2 <= 0.0) { cp = a; return; }
     if (d3 >= 0.0 && d4 <= d3)  { cp = b; return; }
     if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) { cp = a + ab * (d1 / (d1 - d3)); return; }

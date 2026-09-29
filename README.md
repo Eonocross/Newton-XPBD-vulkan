@@ -7,7 +7,7 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 | Hardware | Status | Latest Binaries Download Link |
 | :--- | :---: | :--- |
-| **NVIDIA** | **Effectively Bit-exact** | [Windows x64 / Linux x86_64](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.4.1) |
+| **NVIDIA** | **Effectively Bit-exact** | [Windows x64 / Linux x86_64](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/shaders-v1.4.2) |
 | **AMD (discrete)**  | **Untested** | *Should use standard Windows / Linux binaries* |
 | **AMD (integrated)** | **Untested** | *Should use standard Windows / Linux binaries* |
 | **Intel UHD / Iris Xe** | **Compat\*** | *Should use standard Windows / Linux binaries* |
@@ -21,7 +21,7 @@ Aiming bit-for-bit identical results of the originally cuda Newton XPBD solver a
 
 ### Blender Plugin
 
-[Download Latest Plugin ZIP](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/plugin-v1.1.0) (`newton_vulkan_plugin.py`)
+[Download Latest Plugin ZIP](https://github.com/Eonocross/Newton-XPBD-vulkan/releases/tag/plugin-v1.2.0) (`newton_vulkan_plugin.py`)
 
 ---
 
@@ -49,7 +49,7 @@ Download the plugin package and place `newton_vulkan_plugin.py` into your Blende
 
 ### Step 3: Enable the Addon
 1. In Blender, open **Edit** > **Preferences** > **Add-ons**.
-2. Search for and enable **Newton Vulkan Direct**.
+2. Search for and enable **Newton Vulkan Direct Physics**.
 3. In the 3D Viewport sidebar (`N` panel under **Newton Vulkan**), verify your NVIDIA GPU appears in the **Hardware & Output > GPU** dropdown.
 
 

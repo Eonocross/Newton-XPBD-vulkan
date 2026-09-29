@@ -31,8 +31,14 @@ layout(push_constant) uniform Push {
     uint pad0;
 } pc;
 
-vec3 quat_rotate(vec4 q, vec3 v) {
-    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+vec3 quat_rotate(vec4 q, vec3 x) {
+    float c = 2.0 * q.w * q.w - 1.0;
+    float d = 2.0 * (q.x * x.x + q.y * x.y + q.z * x.z);
+    return vec3(
+        x.x * c + q.x * d + (q.y * x.z - q.z * x.y) * q.w * 2.0,
+        x.y * c + q.y * d + (q.z * x.x - q.x * x.z) * q.w * 2.0,
+        x.z * c + q.z * d + (q.x * x.y - q.y * x.x) * q.w * 2.0
+    );
 }
 
 vec3 velocity_at_point(vec3 body_w, vec3 body_v, vec3 r) {
@@ -72,7 +78,8 @@ void main() {
     vec3 bx = X_pos + quat_rotate(X_rot, c_bpos);
 
     vec3 n = vec3(c_normal[tid * 3 + 0], c_normal[tid * 3 + 1], c_normal[tid * 3 + 2]);
-    float c = dot(n, px - bx) - particle_radius[particle_index];
+    vec3 d_px = px - bx;
+    float c = fma(n.z, d_px.z, fma(n.x, d_px.x, n.y * d_px.y)) - particle_radius[particle_index];
     if (c > pc.particle_ka) return;
 
     vec3 bx_prev = X_pos_prev + quat_rotate(X_rot_prev, c_bpos);
@@ -92,11 +99,16 @@ void main() {
         bv_new = velocity_at_point(body_w_new, body_v_new, r) + bv_contact;
     }
 
-    float rel_vel_old = dot(n, v_old - bv_old);
-    float rel_vel_new = dot(n, v_new - bv_new);
+    vec3 v_diff_old = v_old - bv_old;
+    float rel_vel_old = fma(n.z, v_diff_old.z, fma(n.y, v_diff_old.y, n.x * v_diff_old.x));
+
+    vec3 v_diff_new = v_new - bv_new;
+    float rel_vel_new = fma(n.z, v_diff_new.z, fma(n.x, v_diff_new.x, n.y * v_diff_new.y));
 
     if (rel_vel_old < 0.0) {
-        vec3 dv = n * (-rel_vel_new + max(-pc.restitution * rel_vel_old, 0.0));
+        float restitution_term = max((-pc.restitution) * rel_vel_old, 0.0);
+        float scalar = (-rel_vel_new) + restitution_term;
+        vec3 dv = vec3(n.x * scalar, n.y * scalar, n.z * scalar);
         atomicAdd(v_out_arr[particle_index].x, dv.x);
         atomicAdd(v_out_arr[particle_index].y, dv.y);
         atomicAdd(v_out_arr[particle_index].z, dv.z);

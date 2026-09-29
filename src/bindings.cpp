@@ -52,14 +52,27 @@ PYBIND11_MODULE(vkxpbd, m) {
         .def("add_mesh", [](vkx::XpbdSolver& self,
                             py::array_t<float, py::array::c_style | py::array::forcecast> vertices,
                             py::array_t<uint32_t, py::array::c_style | py::array::forcecast> indices,
-                            float shape_margin) {
+                            float shape_margin,
+                            py::object shape_rot_obj,
+                            py::object is_watertight_obj) {
             py::buffer_info v_info = vertices.request();
             py::buffer_info i_info = indices.request();
             size_t num_verts = v_info.size / 3;
             size_t num_tris = i_info.size / 3;
+            const float* rot_ptr = nullptr;
+            py::array_t<float, py::array::c_style | py::array::forcecast> rot_arr;
+            if (!shape_rot_obj.is_none()) {
+                rot_arr = shape_rot_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                rot_ptr = static_cast<const float*>(rot_arr.request().ptr);
+            }
+            int wt_override = -1;
+            if (!is_watertight_obj.is_none()) {
+                wt_override = is_watertight_obj.cast<bool>() ? 1 : 0;
+            }
             self.add_mesh(static_cast<const float*>(v_info.ptr), num_verts,
-                          static_cast<const uint32_t*>(i_info.ptr), num_tris, shape_margin);
-        }, py::arg("vertices"), py::arg("indices"), py::arg("shape_margin") = 0.0f)
+                          static_cast<const uint32_t*>(i_info.ptr), num_tris, shape_margin, rot_ptr, wt_override);
+        }, py::arg("vertices"), py::arg("indices"), py::arg("shape_margin") = 0.0f,
+           py::arg("shape_rot") = py::none(), py::arg("is_watertight") = py::none())
         .def("finalize_meshes", &vkx::XpbdSolver::finalize_meshes)
         .def("set_particles", [](vkx::XpbdSolver& self,
                                  py::array_t<float, py::array::c_style | py::array::forcecast> q,
@@ -119,6 +132,7 @@ PYBIND11_MODULE(vkxpbd, m) {
             return result;
         })
         .def("collide_only", &vkx::XpbdSolver::collide_only)
+        .def("step_solve_only", &vkx::XpbdSolver::step_solve_only)
         .def("update_mesh", [](vkx::XpbdSolver& self, size_t mesh_index,
                                py::array_t<float, py::array::c_style | py::array::forcecast> verts,
                                std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> velocities) {
@@ -172,6 +186,22 @@ PYBIND11_MODULE(vkxpbd, m) {
             py::array_t<float> result({n, (size_t)3});
             std::memcpy(result.request().ptr, v.data(), v.size() * sizeof(float));
             return result;
+        })
+        .def("set_contact_data", [](vkx::XpbdSolver& self,
+                                    py::array_t<int32_t> particles,
+                                    py::array_t<int32_t> shapes,
+                                    py::array_t<float> body_positions,
+                                    py::array_t<float> normals,
+                                    int contact_count) {
+            auto p_buf = particles.request();
+            auto s_buf = shapes.request();
+            auto bp_buf = body_positions.request();
+            auto n_buf = normals.request();
+            std::vector<int32_t> p_vec((int32_t*)p_buf.ptr, (int32_t*)p_buf.ptr + contact_count);
+            std::vector<int32_t> s_vec((int32_t*)s_buf.ptr, (int32_t*)s_buf.ptr + contact_count);
+            std::vector<float> bp_vec((float*)bp_buf.ptr, (float*)bp_buf.ptr + contact_count * 3);
+            std::vector<float> n_vec((float*)n_buf.ptr, (float*)n_buf.ptr + contact_count * 3);
+            self.set_contact_data(p_vec, s_vec, bp_vec, n_vec, contact_count);
         })
         .def("get_sorted_cells", [](vkx::XpbdSolver& self) {
             auto v = self.get_sorted_cells();

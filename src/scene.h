@@ -65,6 +65,8 @@ struct MeshData {
     std::vector<float> vertices; // x,y,z world coords
     std::vector<uint32_t> indices; // 3 per triangle
     float shape_margin = 0.0f;
+    float shape_rot[4] = {0.f, 0.f, 0.f, 1.f}; // world rotation quat xyzw (identity default)
+    bool is_watertight = false;
 };
 
 class XpbdSolver {
@@ -73,7 +75,9 @@ public:
     ~XpbdSolver();
 
     void init(const SolverConfig& config, size_t num_particles, size_t max_contacts = 0);
-    void add_mesh(const float* verts, size_t num_verts, const uint32_t* tris, size_t num_tris, float shape_margin = 0.0f);
+    void add_mesh(const float* verts, size_t num_verts, const uint32_t* tris, size_t num_tris,
+                  float shape_margin = 0.0f, const float* shape_rot_xyzw = nullptr,
+                  int watertight_override = -1); // rot: world quat xyzw, override: -1=auto-detect, 0=false, 1=true
     void finalize_meshes(); // builds and packs all BVHs
 
     void set_particles(const float* q, const float* qd, const float* inv_mass,
@@ -87,6 +91,7 @@ public:
 
     void step(float dt, int substeps, int iterations);
     void collide_only();
+    void step_solve_only(float dt, int substeps, int iterations);
 
     void get_positions(float* out_q, size_t n);
     void get_velocities(float* out_qd, size_t n);
@@ -100,25 +105,26 @@ public:
     std::vector<float> get_contact_normals();
     std::vector<float> get_contact_body_positions();
     std::vector<float> get_contact_body_velocities();
+    void set_contact_data(const std::vector<int32_t>& particles,
+                          const std::vector<int32_t>& shapes,
+                          const std::vector<float>& body_positions,
+                          const std::vector<float>& normals,
+                          int contact_count);
 
     std::vector<float> get_mesh_bvh_lowers(size_t mesh_index) const;
     std::vector<float> get_mesh_bvh_uppers(size_t mesh_index) const;
 
-    // GPU Grid & Particle-Particle solver diagnostics (read-only)
     std::vector<uint32_t> get_sorted_cells();
     std::vector<uint32_t> get_sorted_point_ids();
     std::vector<int32_t> get_cell_starts();
     std::vector<int32_t> get_cell_ends();
     std::vector<float> get_deltas();
 
-    // Deep GPU Particle-Particle diagnostics
     uint32_t get_diag_pair_count();
     uint32_t get_diag_overflow_count();
     std::vector<GPUPairRecord> get_diag_pairs();
     void reset_diag_buffers();
 
-    // Persistent P11 shape-contact diagnostic readback (32 uints)
-    // slot[0] = sentinel (0xDEAD0001 when written), [1..31] = raw float bits
     std::vector<uint32_t> get_p11_diag();
     std::vector<uint32_t> get_p11_apply_diag();
     std::vector<float> get_shape_contact_diag();
@@ -155,12 +161,12 @@ private:
     Buffer b_point_ids, b_cell_starts, b_cell_ends;
     Buffer b_cc, b_cpart, b_cshape, b_cbodypos, b_cbodyvel, b_cnormal;
     Buffer b_delta, b_q_out, b_qd_out, b_q_init, b_qd_init;
-    Buffer m_vtx, m_idx, m_nl, m_nu, m_meta, m_prim, m_params, m_vvel;
+    Buffer m_vtx, m_idx, m_nl, m_nu, m_meta, m_prim, m_params, m_vvel, m_mesh_rot;
     Buffer g_cells, g_ids;
     Buffer b_diag_header, b_diag_pairs;
-    Buffer b_p11_diag;        // persistent 32-uint P11 shape-contact diagnostic
-    Buffer b_p11_apply_diag;  // persistent 32-uint P11 apply_particle_deltas diagnostic
-    Buffer b_mesh_diag;       // persistent 32-uint mesh candidate diagnostic
+    Buffer b_p11_diag;
+    Buffer b_p11_apply_diag;
+    Buffer b_mesh_diag;
 
     // Sorter
     GpuSort m_sorter;

@@ -119,11 +119,52 @@ void XpbdSolver::init(const SolverConfig& config, size_t num_particles, size_t m
     m_initialized = true;
 }
 
-void XpbdSolver::add_mesh(const float* verts, size_t num_verts, const uint32_t* tris, size_t num_tris, float shape_margin) {
+void XpbdSolver::add_mesh(const float* verts, size_t num_verts, const uint32_t* tris, size_t num_tris,
+                          float shape_margin, const float* shape_rot_xyzw, int watertight_override) {
     MeshData md;
     md.vertices.assign(verts, verts + num_verts * 3);
     md.indices.assign(tris, tris + num_tris * 3);
     md.shape_margin = shape_margin;
+    if (shape_rot_xyzw) {
+        md.shape_rot[0] = shape_rot_xyzw[0];
+        md.shape_rot[1] = shape_rot_xyzw[1];
+        md.shape_rot[2] = shape_rot_xyzw[2];
+        md.shape_rot[3] = shape_rot_xyzw[3];
+    } // else defaults to identity {0,0,0,1}
+
+    if (watertight_override >= 0) {
+        md.is_watertight = (watertight_override != 0);
+    } else {
+        // Auto-detect watertightness: exactly 2 triangles must share every geometric edge.
+        // Matches Warp / Newton: newton.Mesh.is_watertight definition.
+        if (num_tris == 0 || num_verts == 0) {
+            md.is_watertight = false;
+        } else {
+            std::vector<std::pair<uint32_t, uint32_t>> edges;
+            edges.reserve(num_tris * 3);
+            for (size_t t = 0; t < num_tris; t++) {
+                uint32_t i0 = tris[t * 3 + 0];
+                uint32_t i1 = tris[t * 3 + 1];
+                uint32_t i2 = tris[t * 3 + 2];
+                edges.push_back({std::min(i0, i1), std::max(i0, i1)});
+                edges.push_back({std::min(i1, i2), std::max(i1, i2)});
+                edges.push_back({std::min(i2, i0), std::max(i2, i0)});
+            }
+            std::sort(edges.begin(), edges.end());
+            bool closed_manifold = true;
+            size_t i = 0;
+            while (i < edges.size()) {
+                size_t j = i + 1;
+                while (j < edges.size() && edges[j] == edges[i]) j++;
+                if ((j - i) != 2) {
+                    closed_manifold = false;
+                    break;
+                }
+                i = j;
+            }
+            md.is_watertight = closed_manifold;
+        }
+    }
     m_meshes.push_back(std::move(md));
     m_meshes_finalized = false;
 }
@@ -272,14 +313,44 @@ void XpbdSolver::finalize_meshes() {
         m_prim.create(&m_ctx, prim.size()*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         m_prim.upload(prim.data(), prim.size()*4);
 
+        std::vector<uint32_t> mesh_prim_offsets(n_cubes), mesh_prim_counts(n_cubes);
+        size_t p_acc = 0;
+        for (size_t c = 0; c < n_cubes; c++) {
+            mesh_prim_offsets[c] = uint32_t(p_acc);
+            mesh_prim_counts[c]  = uint32_t(m_bvhs[c].primitive_indices.size());
+            p_acc += m_bvhs[c].primitive_indices.size();
+        }
+
         std::vector<uint32_t> mesh_params{uint32_t(m_n_parts), uint32_t(m_contact_max),
                                           *reinterpret_cast<uint32_t*>(&m_config.soft_contact_margin), uint32_t(n_cubes)};
         for (size_t c = 0; c < n_cubes; c++) {
             float sm = m_meshes[c].shape_margin;
             mesh_params.push_back(*reinterpret_cast<uint32_t*>(&sm));
         }
+        for (size_t c = 0; c < n_cubes; c++) {
+            uint32_t wt = m_meshes[c].is_watertight ? 1u : 0u;
+            mesh_params.push_back(wt);
+        }
+        for (size_t c = 0; c < n_cubes; c++) {
+            mesh_params.push_back(mesh_prim_offsets[c]);
+        }
+        for (size_t c = 0; c < n_cubes; c++) {
+            mesh_params.push_back(mesh_prim_counts[c]);
+        }
         m_params.create(&m_ctx, mesh_params.size()*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         m_params.upload(mesh_params.data(), mesh_params.size()*4);
+
+        // Shape rotation quaternions (xyzw, 4 floats per mesh) — used by generate_mesh_contacts
+        // to replicate Warp's local-space normalize + world-transform for contact normals.
+        std::vector<float> mesh_rots(n_cubes * 4);
+        for (size_t c = 0; c < n_cubes; c++) {
+            mesh_rots[c*4+0] = m_meshes[c].shape_rot[0];
+            mesh_rots[c*4+1] = m_meshes[c].shape_rot[1];
+            mesh_rots[c*4+2] = m_meshes[c].shape_rot[2];
+            mesh_rots[c*4+3] = m_meshes[c].shape_rot[3];
+        }
+        m_mesh_rot.create(&m_ctx, mesh_rots.size()*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        m_mesh_rot.upload(mesh_rots.data(), mesh_rots.size()*4);
     }
 
     init_pipelines();
@@ -302,7 +373,7 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_gen, 8, b_cnormal.buffer, b_cnormal.size);
 
     if (!m_meshes.empty()) {
-        sh_mesh.create(&m_ctx, prefix + "generate_mesh_contacts.spv", make_bindings(18), 0);
+        sh_mesh.create(&m_ctx, prefix + "generate_mesh_contacts.spv", make_bindings(19), 0);
         set_mesh = alloc_set(&m_ctx, m_pool, sh_mesh.set_layout);
         m_pool_guard->sets.push_back(set_mesh);
         write_set(&m_ctx, set_mesh, 0, b_q.buffer, b_q.size);
@@ -323,6 +394,7 @@ void XpbdSolver::init_pipelines() {
         write_set(&m_ctx, set_mesh, 15, m_params.buffer, m_params.size);
         write_set(&m_ctx, set_mesh, 16, b_mesh_diag.buffer, b_mesh_diag.size);
         write_set(&m_ctx, set_mesh, 17, m_vvel.buffer, m_vvel.size);
+        write_set(&m_ctx, set_mesh, 18, m_mesh_rot.buffer, m_mesh_rot.size); // shape rotation quats
     }
 
     sh_int.create(&m_ctx, prefix + "integrate_particles.spv", make_bindings(9), 16);
@@ -679,9 +751,11 @@ void XpbdSolver::step(float dt, int substeps, int iterations) {
             if (m_contact_count > 0) {
                 cmd_dispatch(sh_con.pipeline, sh_con.layout, set_con, &pc_con, sizeof(PCCon),
                              (uint32_t)((m_contact_count + 63) / 64));
+                bar();
             }
             cmd_dispatch(sh_pcon.pipeline, sh_pcon.layout, set_pcon, &pc_pcon, sizeof(PCPCon),
                          (uint32_t)((m_n_parts + 63) / 64));
+            bar();
             {
                 VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
                 vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_out.buffer, 1, &c1);
@@ -698,6 +772,7 @@ void XpbdSolver::step(float dt, int substeps, int iterations) {
                 vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
                 VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
                 vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
+                bar();
             }
         }
 
@@ -707,6 +782,164 @@ void XpbdSolver::step(float dt, int substeps, int iterations) {
                          (uint32_t)((m_contact_count + 63) / 64));
         }
 
+        VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
+        {
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &m_ctx.cmd;
+            VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, VK_NULL_HANDLE));
+            VK_CHECK(vkQueueWaitIdle(m_ctx.compute_queue));
+        }
+        vkResetCommandBuffer(m_ctx.cmd, 0);
+    }
+}
+
+void XpbdSolver::step_solve_only(float dt, int substeps, int iterations) {
+    if (!m_meshes_finalized) finalize_meshes();
+
+    float sdt = dt / float(substeps);
+    float cell_width_inv = 1.0f / m_config.search_radius;
+
+    struct PCInt { float dt, v_max, pad0, pad1; } pc_int{sdt, m_config.particle_v_max, 0, 0};
+    struct PCCon {
+        float mu, ka, cmax, dt, relax;
+        int iter_index;
+        int sub_index;
+        int pad1;
+    } pc_con{
+        m_config.soft_contact_mu, m_config.particle_adhesion, (float)m_contact_max,
+        sdt, m_config.soft_contact_relaxation, 0, 0, 0
+    };
+    struct PCPCon {
+        float mu, coh, max_r, dt, relax, n, inv;
+        uint32_t iter_index;
+        uint32_t enable_diag;
+        uint32_t max_pairs;
+        uint32_t pad1, pad2;
+    } pc_pcon{
+        m_config.particle_mu, m_config.particle_cohesion, m_config.particle_max_radius,
+        sdt, m_config.soft_contact_relaxation, (float)m_n_parts, cell_width_inv, 0,
+        m_config.enable_diagnostics ? 1u : 0u,
+        m_config.max_diag_pairs ? m_config.max_diag_pairs : 100000u,
+        0, 0
+    };
+    struct PCApp {
+        float dt, v_max;
+        int iter_index;
+        int sub_index;
+    } pc_app{sdt, m_config.particle_v_max, 0, 0};
+    struct PCGOff { int num_points; int pad0, pad1, pad2; } pc_goff{int(m_n_parts), 0, 0, 0};
+    struct PCGci { float cell_width_inv; float pad0, pad1, pad2; } pc_gci{cell_width_inv, 0, 0, 0};
+    struct PCRest { float particle_ka; float restitution; uint32_t contact_max; uint32_t pad0; } pc_rest{
+        m_config.particle_adhesion, m_config.soft_contact_restitution, uint32_t(m_contact_max), 0
+    };
+
+    auto bar = [&]() {
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                          VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(m_ctx.cmd, &dep);
+    };
+
+    auto cmd_dispatch = [&](VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
+                             const void* pc, size_t pc_size, uint32_t groups) {
+        if (pc && pc_size > 0)
+            vkCmdPushConstants(m_ctx.cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pc_size, pc);
+        vkCmdBindPipeline(m_ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(m_ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        vkCmdDispatch(m_ctx.cmd, groups, 1, 1);
+    };
+    auto record_dispatch = cmd_dispatch;
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    for (int sub = 0; sub < substeps; sub++) {
+        pc_con.sub_index = sub;
+        pc_app.sub_index = sub;
+
+        // Step phase (integrate + grid — contact gen SKIPPED)
+        VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
+        {
+            VkBufferCopy c{0, 0, m_n_parts * 4 * 4};
+            vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_init.buffer, 1, &c);
+            vkCmdCopyBuffer(m_ctx.cmd, b_qd.buffer, b_qd_init.buffer, 1, &c);
+            bar();
+        }
+        cmd_dispatch(sh_int.pipeline, sh_int.layout, set_int, &pc_int, sizeof(PCInt),
+                     (uint32_t)((m_n_parts + 63) / 64));
+        {
+            VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
+            vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
+            VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
+            vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
+            bar();
+        }
+        cmd_dispatch(sh_gci.pipeline, sh_gci.layout, set_gci, &pc_gci, sizeof(PCGci),
+                     (uint32_t)((m_n_parts + 63) / 64));
+        vkCmdFillBuffer(m_ctx.cmd, m_sorter.global_hist.buffer, 0, m_sorter.global_hist.size, 0);
+        bar();
+        m_sorter.record(&m_ctx, m_ctx.cmd, g_cells.buffer, g_ids.buffer, (uint32_t)m_n_parts);
+        vkCmdFillBuffer(m_ctx.cmd, b_cell_starts.buffer, 0, NUM_CELLS * 4, 0);
+        bar();
+        vkCmdFillBuffer(m_ctx.cmd, b_cell_ends.buffer, 0, NUM_CELLS * 4, 0);
+        bar();
+        cmd_dispatch(sh_goff.pipeline, sh_goff.layout, set_goff, &pc_goff, sizeof(PCGOff),
+                     (uint32_t)((m_n_parts + 63) / 64));
+        VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
+        {
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &m_ctx.cmd;
+            VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, VK_NULL_HANDLE));
+            VK_CHECK(vkQueueWaitIdle(m_ctx.compute_queue));
+        }
+        vkResetCommandBuffer(m_ctx.cmd, 0);
+
+        // Iteration loop (using pre-injected contacts)
+        VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
+        for (int iter = 0; iter < iterations; iter++) {
+            pc_con.iter_index = iter;
+            pc_pcon.iter_index = uint32_t(iter);
+            vkCmdFillBuffer(m_ctx.cmd, b_delta.buffer, 0, m_n_parts * 3 * 4, 0);
+            bar();
+            if (m_contact_count > 0) {
+                cmd_dispatch(sh_con.pipeline, sh_con.layout, set_con, &pc_con, sizeof(PCCon),
+                             (uint32_t)((m_contact_count + 63) / 64));
+                bar();
+            }
+            cmd_dispatch(sh_pcon.pipeline, sh_pcon.layout, set_pcon, &pc_pcon, sizeof(PCPCon),
+                         (uint32_t)((m_n_parts + 63) / 64));
+            bar();
+            {
+                VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
+                vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_out.buffer, 1, &c1);
+                VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
+                vkCmdCopyBuffer(m_ctx.cmd, b_qd.buffer, b_qd_out.buffer, 1, &c2);
+                bar();
+            }
+            pc_app.iter_index = iter;
+            pc_app.sub_index = sub;
+            cmd_dispatch(sh_app.pipeline, sh_app.layout, set_app, &pc_app, sizeof(PCApp),
+                         (uint32_t)((m_n_parts + 63) / 64));
+            {
+                VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
+                vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
+                VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
+                vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
+                bar();
+            }
+        }
+        if (m_config.enable_restitution && m_contact_count > 0) {
+            cmd_dispatch(sh_rest.pipeline, sh_rest.layout, set_rest, &pc_rest, sizeof(PCRest),
+                         (uint32_t)((m_contact_count + 63) / 64));
+        }
         VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
         {
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -792,6 +1025,19 @@ std::vector<float> XpbdSolver::get_contact_body_velocities() {
     auto raw = b_cbodyvel.download(m_contact_count * 3 * 4);
     const float* p = reinterpret_cast<const float*>(raw.data());
     return std::vector<float>(p, p + m_contact_count * 3);
+}
+
+void XpbdSolver::set_contact_data(const std::vector<int32_t>& particles,
+                                   const std::vector<int32_t>& shapes,
+                                   const std::vector<float>& body_positions,
+                                   const std::vector<float>& normals,
+                                   int contact_count) {
+    m_contact_count = contact_count;
+    if (contact_count <= 0) return;
+    b_cpart.upload(reinterpret_cast<const uint8_t*>(particles.data()),   contact_count * 4);
+    b_cshape.upload(reinterpret_cast<const uint8_t*>(shapes.data()),      contact_count * 4);
+    b_cbodypos.upload(reinterpret_cast<const uint8_t*>(body_positions.data()), contact_count * 3 * 4);
+    b_cnormal.upload(reinterpret_cast<const uint8_t*>(normals.data()),    contact_count * 3 * 4);
 }
 
 std::vector<uint32_t> XpbdSolver::get_sorted_cells() {

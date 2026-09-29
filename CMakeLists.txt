@@ -9,6 +9,14 @@ find_package(Vulkan REQUIRED)
 
 # Find Python and pybind11
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+if(NOT pybind11_DIR)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 find_package(pybind11 CONFIG REQUIRED)
 
 # vkxpbd Python C++ extension module
