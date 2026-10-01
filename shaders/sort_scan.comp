@@ -1,7 +1,7 @@
 // sort_scan - GPU radix sort pass B: prefix sum over workgroup histograms.
-// Turns per-workgroup histograms into global scatter offsets.
+// Dispatched with 256 workgroups (one per bin: gl_WorkGroupID.x = bin).
+// 256 threads per bin, chunked sum + shared-memory Hillis-Steele scan + chunked parallel rewrite.
 #version 450
-
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) buffer GlobalHist { uint global_hist[]; };
@@ -10,45 +10,45 @@ layout(std430, binding = 1) buffer Scanned { uint scanned[]; };
 layout(push_constant) uniform PC {
     uint n;
     uint shift;
-    uint groups; // number of workgroups
+    uint groups;
     uint pad;
 } pc;
 
-shared uint col_total[256];   // per-bin totals
-shared uint col_scan[2][256]; // Hillis-Steele scratch
+shared uint s_scan[2][256];
 
 void main() {
-    uint bin = gl_LocalInvocationID.x;
+    uint bin = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint chunk = (pc.groups + 255u) / 256u;
+    uint g0 = min(lid * chunk, pc.groups);
+    uint g1 = min(g0 + chunk, pc.groups);
 
-    // 1. per-bin total across workgroups
-    uint total = 0;
-    for (uint g = 0; g < pc.groups; g++) total += global_hist[g * 256u + bin];
-    col_total[bin] = total;
-    barrier();
-    memoryBarrierShared();
+    // A: sum this thread's chunk (independent loads, no stores)
+    uint sum = 0u;
+    for (uint g = g0; g < g1; g++) {
+        sum += global_hist[g * 256u + bin];
+    }
 
-    // 2. exclusive scan over bins
-    col_scan[0][bin] = total;
+    // B: inclusive Hillis-Steele scan of the 256 chunk sums
+    s_scan[0][lid] = sum;
     barrier();
-    memoryBarrierShared();
+
     int src = 0;
-    for (uint offset = 1; offset < 256; offset <<= 1) {
+    for (uint off = 1u; off < 256u; off <<= 1) {
         int dst = src ^ 1;
-        if (bin >= offset) col_scan[dst][bin] = col_scan[src][bin] + col_scan[src][bin - offset];
-        else col_scan[dst][bin] = col_scan[src][bin];
+        s_scan[dst][lid] = (lid >= off) ? (s_scan[src][lid] + s_scan[src][lid - off])
+                                        : s_scan[src][lid];
         barrier();
-        memoryBarrierShared();
         src = dst;
     }
-    uint excl = (bin == 0) ? 0u : col_scan[src][bin - 1];
-    scanned[bin] = excl;
 
-    // 3. per-WG exclusive scan over g for this bin, rewrite global_hist in place.
-    //    Keep a copy of this bin's counts (already read col per g? we need per-g
-    //    values again) - re-read from global_hist while rewriting carefully:
-    //    we rewrite g ascending, accumulating running = excl + sum_{g'<g}.
-    uint running = excl;
-    for (uint g = 0; g < pc.groups; g++) {
+    uint running = (lid == 0u) ? 0u : s_scan[src][lid - 1u];
+    if (lid == 255u) {
+        scanned[bin] = s_scan[src][255];
+    }
+
+    // C: rewrite this chunk as an exclusive prefix
+    for (uint g = g0; g < g1; g++) {
         uint idx = g * 256u + bin;
         uint c = global_hist[idx];
         global_hist[idx] = running;

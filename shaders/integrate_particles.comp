@@ -1,25 +1,20 @@
 // integrate_particles - Forward Euler / symplectic integration for particles.
-// Based on newton/newton/_src/solvers/solver.py::integrate_particles
-//
-// Math:
-//   if (particle_flags[tid] & ACTIVE) == 0: x_new = x0; return
-//   v1 = v0 + (f0 * inv_mass + world_g * (inv_mass > 0 ? 1 : 0)) * dt
-//   v1 magnitude clamped to v_max
-//   x1 = x0 + v1 * dt
+// Symplectic Euler integration with in-place state update.
+// Reads q, qd; writes q_init, qd_init (the originals); updates q, qd in-place.
 #version 450
 
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) readonly buffer X { vec4 x[]; };          // particle_q (xyz, pad)
-layout(std430, binding = 1) readonly buffer V { vec4 v[]; };          // particle_qd (xyz, pad)
+layout(std430, binding = 0) buffer X { vec4 x[]; };                   // particle_q (in-place)
+layout(std430, binding = 1) buffer V { vec4 v[]; };                   // particle_qd (in-place)
 layout(std430, binding = 2) readonly buffer F { vec4 f[]; };          // external force (xyz, pad)
 layout(std430, binding = 3) readonly buffer W { float w[]; };         // particle_inv_mass
 layout(std430, binding = 4) readonly buffer Flags { int particle_flags[]; };
 layout(std430, binding = 5) readonly buffer World { int particle_world[]; };
 layout(std430, binding = 6) readonly buffer Gravity { vec4 gravity[]; }; // per-world gravity (xyz, pad)
 
-layout(std430, binding = 7) writeonly buffer XNew { vec4 x_new[]; };
-layout(std430, binding = 8) writeonly buffer VNew { vec4 v_new[]; };
+layout(std430, binding = 7) writeonly buffer XInit { vec4 x_init[]; }; // particle_q_init
+layout(std430, binding = 8) writeonly buffer VInit { vec4 v_init[]; }; // particle_qd_init
 
 layout(push_constant) uniform PC {
     float dt;
@@ -33,12 +28,17 @@ void main() {
     if (tid >= uint(x.length())) return;
 
     vec3 x0 = x[tid].xyz;
+    vec3 v0 = v[tid].xyz;
+
+    // Preserve initial state for substep constraint solving
+    x_init[tid] = vec4(x0, 0.0);
+    v_init[tid] = vec4(v0, 0.0);
+
     if ((particle_flags[tid] & 1) == 0) {   // ACTIVE bit
-        x_new[tid] = vec4(x0, 0.0);
+        // Inactive particles do not move; in-place x and v remain x0 and v0
         return;
     }
 
-    vec3 v0 = v[tid].xyz;
     vec3 f0 = f[tid].xyz;
 
     float inv_mass = w[tid];
@@ -54,6 +54,7 @@ void main() {
 
     vec3 x1 = x0 + v1 * pc.dt;
 
-    x_new[tid] = vec4(x1, 0.0);
-    v_new[tid] = vec4(v1, 0.0);
+    // Write predicted state in-place
+    x[tid] = vec4(x1, 0.0);
+    v[tid] = vec4(v1, 0.0);
 }

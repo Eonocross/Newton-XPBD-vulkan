@@ -4,6 +4,13 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cstring>
+#include <chrono>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace vkx {
 
@@ -22,6 +29,18 @@ XpbdSolver::XpbdSolver() = default;
 XpbdSolver::~XpbdSolver() {
     if (m_ctx.device) {
         vkDeviceWaitIdle(m_ctx.device);
+        if (m_frame_fence) {
+            vkDestroyFence(m_ctx.device, m_frame_fence, nullptr);
+            m_frame_fence = VK_NULL_HANDLE;
+        }
+        if (m_profiling_enabled) {
+            print_profiler_summary();
+            if (m_query_pool) {
+                vkDestroyQueryPool(m_ctx.device, m_query_pool, nullptr);
+                m_query_pool = VK_NULL_HANDLE;
+            }
+        }
+        m_substep_cmds.clear();
     }
 }
 
@@ -95,8 +114,8 @@ void XpbdSolver::init(const SolverConfig& config, size_t num_particles, size_t m
     uint32_t max_pairs = m_config.max_diag_pairs ? m_config.max_diag_pairs : 100000;
     b_diag_pairs.create(&m_ctx, max_pairs * sizeof(GPUPairRecord), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Full shape-contact diagnostic buffer: up to 4 iterations * m_contact_max * 32 floats
-    size_t shape_diag_floats = 4 * (m_contact_max > 0 ? m_contact_max : 100000) * 32;
+    // Full shape-contact diagnostic buffer: only allocate full size if diagnostics enabled
+    size_t shape_diag_floats = m_config.enable_diagnostics ? (4 * (m_contact_max > 0 ? m_contact_max : 100000) * 32) : 32;
     b_p11_diag.create(&m_ctx, shape_diag_floats * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     b_p11_diag.fill_zero(shape_diag_floats * sizeof(float));
 
@@ -115,6 +134,19 @@ void XpbdSolver::init(const SolverConfig& config, size_t num_particles, size_t m
 
     m_sorter.create(&m_ctx, m_n_parts, m_pool, *m_pool_guard, m_config.shader_dir);
     m_sorter.bind_static(&m_ctx, g_cells.buffer, g_ids.buffer);
+
+    const char* prof_env = std::getenv("VKXPBD_PROFILE");
+    bool env_enabled = prof_env && (std::strcmp(prof_env, "1") == 0 || std::strcmp(prof_env, "true") == 0);
+    if (m_config.enable_profile || env_enabled) {
+        m_profiling_enabled = true;
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 64; // Max queries recorded per substep command buffer
+        VK_CHECK(vkCreateQueryPool(m_ctx.device, &qpci, nullptr, &m_query_pool));
+        printf("[Newton Vulkan] GPU Profiler ENABLED (timestampPeriod = %.4f ns)\n", m_ctx.props.limits.timestampPeriod);
+    } else {
+        m_profiling_enabled = false;
+    }
 
     m_initialized = true;
 }
@@ -406,10 +438,16 @@ void XpbdSolver::init_pipelines() {
     set_con = alloc_set(&m_ctx, m_pool, sh_con.set_layout);
     set_pcon = alloc_set(&m_ctx, m_pool, sh_pcon.set_layout);
     set_app = alloc_set(&m_ctx, m_pool, sh_app.set_layout);
+    set_con_flip = alloc_set(&m_ctx, m_pool, sh_con.set_layout);
+    set_pcon_flip = alloc_set(&m_ctx, m_pool, sh_pcon.set_layout);
+    set_app_flip = alloc_set(&m_ctx, m_pool, sh_app.set_layout);
     m_pool_guard->sets.push_back(set_int);
     m_pool_guard->sets.push_back(set_con);
     m_pool_guard->sets.push_back(set_pcon);
     m_pool_guard->sets.push_back(set_app);
+    m_pool_guard->sets.push_back(set_con_flip);
+    m_pool_guard->sets.push_back(set_pcon_flip);
+    m_pool_guard->sets.push_back(set_app_flip);
 
     write_set(&m_ctx, set_int, 0, b_q.buffer, b_q.size);
     write_set(&m_ctx, set_int, 1, b_qd.buffer, b_qd.size);
@@ -418,8 +456,8 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_int, 4, b_flags.buffer, b_flags.size);
     write_set(&m_ctx, set_int, 5, b_world.buffer, b_world.size);
     write_set(&m_ctx, set_int, 6, b_grav.buffer, b_grav.size);
-    write_set(&m_ctx, set_int, 7, b_q_out.buffer, b_q_out.size);
-    write_set(&m_ctx, set_int, 8, b_qd_out.buffer, b_qd_out.size);
+    write_set(&m_ctx, set_int, 7, b_q_init.buffer, b_q_init.size);
+    write_set(&m_ctx, set_int, 8, b_qd_init.buffer, b_qd_init.size);
 
     write_set(&m_ctx, set_con, 0, b_q.buffer, b_q.size);
     write_set(&m_ctx, set_con, 1, b_qd.buffer, b_qd.size);
@@ -444,6 +482,30 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_con, 20, b_body_delta.buffer, b_body_delta.size);
     write_set(&m_ctx, set_con, 21, b_p11_diag.buffer, b_p11_diag.size);
 
+    // set_con_flip: reads from b_q_out and b_qd_out
+    write_set(&m_ctx, set_con_flip, 0, b_q_out.buffer, b_q_out.size);
+    write_set(&m_ctx, set_con_flip, 1, b_qd_out.buffer, b_qd_out.size);
+    write_set(&m_ctx, set_con_flip, 2, b_invm.buffer, b_invm.size);
+    write_set(&m_ctx, set_con_flip, 3, b_radius.buffer, b_radius.size);
+    write_set(&m_ctx, set_con_flip, 4, b_flags.buffer, b_flags.size);
+    write_set(&m_ctx, set_con_flip, 5, b_body_q.buffer, b_body_q.size);
+    write_set(&m_ctx, set_con_flip, 6, b_body_qd.buffer, b_body_qd.size);
+    write_set(&m_ctx, set_con_flip, 7, b_body_com.buffer, b_body_com.size);
+    write_set(&m_ctx, set_con_flip, 8, b_body_invI.buffer, b_body_invI.size);
+    write_set(&m_ctx, set_con_flip, 9, b_body_invm.buffer, b_body_invm.size);
+    write_set(&m_ctx, set_con_flip, 10, b_body_flags.buffer, b_body_flags.size);
+    write_set(&m_ctx, set_con_flip, 11, b_shape_body.buffer, b_shape_body.size);
+    write_set(&m_ctx, set_con_flip, 12, b_mu.buffer, b_mu.size);
+    write_set(&m_ctx, set_con_flip, 13, b_cc.buffer, b_cc.size);
+    write_set(&m_ctx, set_con_flip, 14, b_cpart.buffer, b_cpart.size);
+    write_set(&m_ctx, set_con_flip, 15, b_cshape.buffer, b_cshape.size);
+    write_set(&m_ctx, set_con_flip, 16, b_cbodypos.buffer, b_cbodypos.size);
+    write_set(&m_ctx, set_con_flip, 17, b_cbodyvel.buffer, b_cbodyvel.size);
+    write_set(&m_ctx, set_con_flip, 18, b_cnormal.buffer, b_cnormal.size);
+    write_set(&m_ctx, set_con_flip, 19, b_delta.buffer, b_delta.size);
+    write_set(&m_ctx, set_con_flip, 20, b_body_delta.buffer, b_body_delta.size);
+    write_set(&m_ctx, set_con_flip, 21, b_p11_diag.buffer, b_p11_diag.size);
+
     write_set(&m_ctx, set_pcon, 0, b_point_ids.buffer, b_point_ids.size);
     write_set(&m_ctx, set_pcon, 1, b_cell_starts.buffer, b_cell_starts.size);
     write_set(&m_ctx, set_pcon, 2, b_cell_ends.buffer, b_cell_ends.size);
@@ -456,6 +518,20 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_pcon, 9, b_diag_header.buffer, b_diag_header.size);
     write_set(&m_ctx, set_pcon, 10, b_diag_pairs.buffer, b_diag_pairs.size);
 
+    // set_pcon_flip: reads from b_q_out and b_qd_out
+    write_set(&m_ctx, set_pcon_flip, 0, b_point_ids.buffer, b_point_ids.size);
+    write_set(&m_ctx, set_pcon_flip, 1, b_cell_starts.buffer, b_cell_starts.size);
+    write_set(&m_ctx, set_pcon_flip, 2, b_cell_ends.buffer, b_cell_ends.size);
+    write_set(&m_ctx, set_pcon_flip, 3, b_q_out.buffer, b_q_out.size);
+    write_set(&m_ctx, set_pcon_flip, 4, b_qd_out.buffer, b_qd_out.size);
+    write_set(&m_ctx, set_pcon_flip, 5, b_invm.buffer, b_invm.size);
+    write_set(&m_ctx, set_pcon_flip, 6, b_radius.buffer, b_radius.size);
+    write_set(&m_ctx, set_pcon_flip, 7, b_flags.buffer, b_flags.size);
+    write_set(&m_ctx, set_pcon_flip, 8, b_delta.buffer, b_delta.size);
+    write_set(&m_ctx, set_pcon_flip, 9, b_diag_header.buffer, b_diag_header.size);
+    write_set(&m_ctx, set_pcon_flip, 10, b_diag_pairs.buffer, b_diag_pairs.size);
+
+    // set_app (even iter): reads b_q, writes b_q_out / b_qd_out
     write_set(&m_ctx, set_app, 0, b_q_init.buffer, b_q_init.size);
     write_set(&m_ctx, set_app, 1, b_q.buffer, b_q.size);
     write_set(&m_ctx, set_app, 2, b_flags.buffer, b_flags.size);
@@ -463,6 +539,15 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_app, 4, b_q_out.buffer, b_q_out.size);
     write_set(&m_ctx, set_app, 5, b_qd_out.buffer, b_qd_out.size);
     write_set(&m_ctx, set_app, 6, b_p11_apply_diag.buffer, b_p11_apply_diag.size);
+
+    // set_app_flip (odd iter): reads b_q_out, writes b_q / b_qd
+    write_set(&m_ctx, set_app_flip, 0, b_q_init.buffer, b_q_init.size);
+    write_set(&m_ctx, set_app_flip, 1, b_q_out.buffer, b_q_out.size);
+    write_set(&m_ctx, set_app_flip, 2, b_flags.buffer, b_flags.size);
+    write_set(&m_ctx, set_app_flip, 3, b_delta.buffer, b_delta.size);
+    write_set(&m_ctx, set_app_flip, 4, b_q.buffer, b_q.size);
+    write_set(&m_ctx, set_app_flip, 5, b_qd.buffer, b_qd.size);
+    write_set(&m_ctx, set_app_flip, 6, b_p11_apply_diag.buffer, b_p11_apply_diag.size);
 
     sh_gci.create(&m_ctx, prefix + "grid_cell_indices.spv", make_bindings(3), 16);
     sh_goff.create(&m_ctx, prefix + "grid_offsets.spv", make_bindings(3), 16);
@@ -479,6 +564,7 @@ void XpbdSolver::init_pipelines() {
     write_set(&m_ctx, set_goff, 1, b_cell_starts.buffer, b_cell_starts.size);
     write_set(&m_ctx, set_goff, 2, b_cell_ends.buffer, b_cell_ends.size);
     write_set(&m_ctx, set_pcon, 0, m_sorter.vals_a.buffer, m_sorter.vals_a.size);
+    write_set(&m_ctx, set_pcon_flip, 0, m_sorter.vals_a.buffer, m_sorter.vals_a.size);
 
     sh_rest.create(&m_ctx, prefix + "apply_particle_shape_restitution.spv", make_bindings(18), 16);
     set_rest = alloc_set(&m_ctx, m_pool, sh_rest.set_layout);
@@ -678,119 +764,330 @@ void XpbdSolver::step(float dt, int substeps, int iterations) {
         bar();
     };
 
+    // Ensure sufficient command buffers allocated for all substeps
+    if (m_substep_cmds.size() < (size_t)substeps) {
+        if (!m_substep_cmds.empty()) {
+            vkFreeCommandBuffers(m_ctx.device, m_ctx.command_pool, (uint32_t)m_substep_cmds.size(), m_substep_cmds.data());
+            m_substep_cmds.clear();
+        }
+        m_substep_cmds.resize(substeps, VK_NULL_HANDLE);
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = m_ctx.command_pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = (uint32_t)substeps;
+        VK_CHECK(vkAllocateCommandBuffers(m_ctx.device, &cai, m_substep_cmds.data()));
+    }
+
+    if (!m_frame_fence) {
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VK_CHECK(vkCreateFence(m_ctx.device, &fci, nullptr, &m_frame_fence));
+    }
+
+    // Ensure query pool capacity for all substeps in this frame (64 queries per substep)
+    uint32_t required_queries = (uint32_t)substeps * 64;
+    if (m_profiling_enabled && (!m_query_pool || m_query_pool_capacity < required_queries)) {
+        if (m_query_pool) {
+            vkDestroyQueryPool(m_ctx.device, m_query_pool, nullptr);
+            m_query_pool = VK_NULL_HANDLE;
+        }
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = required_queries;
+        VK_CHECK(vkCreateQueryPool(m_ctx.device, &qpci, nullptr, &m_query_pool));
+        m_query_pool_capacity = required_queries;
+    }
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    auto step_wall_t0 = std::chrono::high_resolution_clock::now();
+
     for (int sub = 0; sub < substeps; sub++) {
         pc_con.sub_index = sub;
-        // Collide phase: zero contact counter on host/GPU buffer before dispatches
-        b_cc.fill_zero(4);
+        pc_app.sub_index = sub;
+
+        VkCommandBuffer cmd = m_substep_cmds[sub];
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        auto bar_cmd = [&](VkCommandBuffer c) {
+            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(c, &dep);
+        };
+
+        auto cmd_dispatch_c = [&](VkCommandBuffer c, VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
+                                  void* pc, size_t pc_size, uint32_t groups) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+            if (pc_size) vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pc_size, pc);
+            vkCmdDispatch(c, groups, 1, 1);
+            bar_cmd(c);
+        };
+
+        // Every substep command buffer begins with a full pipeline barrier
+        bar_cmd(cmd);
+
+        uint32_t q_base = (uint32_t)sub * 64;
+        auto ts_mark = [&](uint32_t offset) {
+            if (m_profiling_enabled && m_query_pool) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_query_pool, q_base + offset);
+            }
+        };
+
+        if (sub == 0 && m_profiling_enabled && m_query_pool) {
+            vkResetQueryPool(m_ctx.device, m_query_pool, 0, required_queries);
+        }
+
+        // 1. Collide phase: zero contact counter on GPU via vkCmdFillBuffer
+        ts_mark(0);
+        vkCmdFillBuffer(cmd, b_cc.buffer, 0, 4, 0);
+        bar_cmd(cmd);
+
         if (m_config.has_ground_plane) {
-            record_dispatch(sh_gen.pipeline, sh_gen.layout, set_gen, &pc_gen, sizeof(PCGen),
-                            (uint32_t)((m_n_parts + 63) / 64));
+            cmd_dispatch_c(cmd, sh_gen.pipeline, sh_gen.layout, set_gen, &pc_gen, sizeof(PCGen),
+                           (uint32_t)((m_n_parts + 63) / 64));
         }
         if (!m_meshes.empty()) {
-            record_dispatch(sh_mesh.pipeline, sh_mesh.layout, set_mesh, nullptr, 0,
-                            (uint32_t)((m_n_parts + 63) / 64));
+            cmd_dispatch_c(cmd, sh_mesh.pipeline, sh_mesh.layout, set_mesh, nullptr, 0,
+                           (uint32_t)((m_n_parts + 63) / 64));
         }
-        {
-            auto cc = b_cc.download(4);
-            m_contact_count = *reinterpret_cast<int32_t*>(cc.data());
-            if (m_contact_count > (int)m_contact_max) m_contact_count = (int)m_contact_max;
+        ts_mark(1); // 0..1: Collide phase (ground plane + mesh contact gen)
+
+        // 2. Step phase (integrate + sort + grid offsets)
+        // 2a. Initial state capture (fused into integrate)
+        ts_mark(2);
+        ts_mark(3); // 2..3: initial q/qd copy (now 0 ms)
+
+        // 2b. Integrate (in-place x, v + writes q_init, qd_init)
+        ts_mark(4);
+        cmd_dispatch_c(cmd, sh_int.pipeline, sh_int.layout, set_int, &pc_int, sizeof(PCInt),
+                       (uint32_t)((m_n_parts + 63) / 64));
+        ts_mark(5); // 4..5: integrate
+
+        // 2c. Integrate state update (fused into integrate)
+        ts_mark(6);
+        ts_mark(7); // 6..7: integrate copies (now 0 ms)
+
+        // 2d. Grid cell indices
+        ts_mark(8);
+        cmd_dispatch_c(cmd, sh_gci.pipeline, sh_gci.layout, set_gci, &pc_gci, sizeof(PCGci),
+                       (uint32_t)((m_n_parts + 63) / 64));
+        ts_mark(9); // 8..9: grid cell indices
+
+        // 2e. Radix sort (3 passes: histogram, scan, scatter per pass)
+        uint32_t qidx = 10;
+        GpuSort::PC sort_pc{uint32_t(m_n_parts), 0, m_sorter.groups, 0};
+        for (uint32_t pass = 0; pass < 3; pass++) {
+            sort_pc.shift = pass * 8;
+
+            // Histogram
+            ts_mark(qidx++);
+            VkDescriptorSet hs = (pass == 0) ? m_sorter.hist_src : (pass == 1 ? m_sorter.hist_a : m_sorter.hist_b);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sorter.histogram.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sorter.histogram.layout, 0, 1, &hs, 0, nullptr);
+            vkCmdPushConstants(cmd, m_sorter.histogram.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuSort::PC), &sort_pc);
+            vkCmdDispatch(cmd, m_sorter.groups, 1, 1);
+            bar_cmd(cmd);
+            ts_mark(qidx++);
+
+            // Scan: Three-kernel coalesced scan
+            ts_mark(qidx++);
+            m_sorter.record_scan_pass(&m_ctx, cmd, pass, uint32_t(m_n_parts));
+            ts_mark(qidx++);
+
+            // Scatter
+            ts_mark(qidx++);
+            VkDescriptorSet sc = (pass == 0) ? m_sorter.sc_src : (pass == 1 ? m_sorter.sc_a : m_sorter.sc_b);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sorter.scatter.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sorter.scatter.layout, 0, 1, &sc, 0, nullptr);
+            vkCmdPushConstants(cmd, m_sorter.scatter.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuSort::PC), &sort_pc);
+            vkCmdDispatch(cmd, m_sorter.groups, 1, 1);
+            bar_cmd(cmd);
+            ts_mark(qidx++);
         }
+        
 
-        // Step phase
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
+        // 2f. Cell fills
+        ts_mark(28);
+        vkCmdFillBuffer(cmd, b_cell_starts.buffer, 0, NUM_CELLS * 4, 0);
+        bar_cmd(cmd);
+        vkCmdFillBuffer(cmd, b_cell_ends.buffer, 0, NUM_CELLS * 4, 0);
+        bar_cmd(cmd);
+        ts_mark(29); // 28..29: cell fills
 
-        {
-            VkBufferCopy c{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_init.buffer, 1, &c);
-            vkCmdCopyBuffer(m_ctx.cmd, b_qd.buffer, b_qd_init.buffer, 1, &c);
-            bar();
-        }
+        // 2g. Grid offsets
+        ts_mark(30);
+        cmd_dispatch_c(cmd, sh_goff.pipeline, sh_goff.layout, set_goff, &pc_goff, sizeof(PCGOff),
+                       (uint32_t)((m_n_parts + 63) / 64));
+        ts_mark(31); // 30..31: grid offsets
 
-        cmd_dispatch(sh_int.pipeline, sh_int.layout, set_int, &pc_int, sizeof(PCInt),
-                     (uint32_t)((m_n_parts + 63) / 64));
-        {
-            VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
-            VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
-            bar();
-        }
-
-        cmd_dispatch(sh_gci.pipeline, sh_gci.layout, set_gci, &pc_gci, sizeof(PCGci),
-                     (uint32_t)((m_n_parts + 63) / 64));
-        vkCmdFillBuffer(m_ctx.cmd, m_sorter.global_hist.buffer, 0, m_sorter.global_hist.size, 0);
-        bar();
-        m_sorter.record(&m_ctx, m_ctx.cmd, g_cells.buffer, g_ids.buffer, (uint32_t)m_n_parts);
-
-        vkCmdFillBuffer(m_ctx.cmd, b_cell_starts.buffer, 0, NUM_CELLS * 4, 0);
-        bar();
-        vkCmdFillBuffer(m_ctx.cmd, b_cell_ends.buffer, 0, NUM_CELLS * 4, 0);
-        bar();
-        cmd_dispatch(sh_goff.pipeline, sh_goff.layout, set_goff, &pc_goff, sizeof(PCGOff),
-                     (uint32_t)((m_n_parts + 63) / 64));
-
-        VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
-        {
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &m_ctx.cmd;
-            VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(m_ctx.compute_queue));
-        }
-        vkResetCommandBuffer(m_ctx.cmd, 0);
-
-        // Iteration loop
-        VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
+        // 3. Iteration loop
+        // 3. Iteration loop (ping-pong descriptor sets between b_q/b_qd and b_q_out/b_qd_out)
+        qidx = 32;
         for (int iter = 0; iter < iterations; iter++) {
+            bool flip = (iter % 2 != 0);
+            VkDescriptorSet cur_con = flip ? set_con_flip : set_con;
+            VkDescriptorSet cur_pcon = flip ? set_pcon_flip : set_pcon;
+            VkDescriptorSet cur_app = flip ? set_app_flip : set_app;
+
             pc_con.iter_index = iter;
             pc_pcon.iter_index = uint32_t(iter);
-            vkCmdFillBuffer(m_ctx.cmd, b_delta.buffer, 0, m_n_parts * 3 * 4, 0);
-            bar();
-            if (m_contact_count > 0) {
-                cmd_dispatch(sh_con.pipeline, sh_con.layout, set_con, &pc_con, sizeof(PCCon),
-                             (uint32_t)((m_contact_count + 63) / 64));
-                bar();
-            }
-            cmd_dispatch(sh_pcon.pipeline, sh_pcon.layout, set_pcon, &pc_pcon, sizeof(PCPCon),
-                         (uint32_t)((m_n_parts + 63) / 64));
-            bar();
-            {
-                VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
-                vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_out.buffer, 1, &c1);
-                VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
-                vkCmdCopyBuffer(m_ctx.cmd, b_qd.buffer, b_qd_out.buffer, 1, &c2);
-                bar();
-            }
+            vkCmdFillBuffer(cmd, b_delta.buffer, 0, m_n_parts * 3 * 4, 0);
+            bar_cmd(cmd);
+
+            ts_mark(qidx);
+            cmd_dispatch_c(cmd, sh_con.pipeline, sh_con.layout, cur_con, &pc_con, sizeof(PCCon),
+                           (uint32_t)((m_contact_max + 63) / 64));
+            ts_mark(qidx + 1);
+
+            ts_mark(qidx + 2);
+            cmd_dispatch_c(cmd, sh_pcon.pipeline, sh_pcon.layout, cur_pcon, &pc_pcon, sizeof(PCPCon),
+                           (uint32_t)((m_n_parts + 63) / 64));
+            ts_mark(qidx + 3);
+
+            ts_mark(qidx + 4);
+            // Pre-apply copies eliminated via descriptor ping-pong
+            ts_mark(qidx + 5);
+
             pc_app.iter_index = iter;
             pc_app.sub_index = sub;
-            cmd_dispatch(sh_app.pipeline, sh_app.layout, set_app, &pc_app, sizeof(PCApp),
-                         (uint32_t)((m_n_parts + 63) / 64));
-            {
-                VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
-                vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
-                VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
-                vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
-                bar();
+            ts_mark(qidx + 6);
+            cmd_dispatch_c(cmd, sh_app.pipeline, sh_app.layout, cur_app, &pc_app, sizeof(PCApp),
+                           (uint32_t)((m_n_parts + 63) / 64));
+            ts_mark(qidx + 7);
+
+            ts_mark(qidx + 8);
+            // Post-apply copies eliminated via descriptor ping-pong
+            ts_mark(qidx + 9);
+
+            qidx += 10;
+        }
+
+        // If total iterations is odd, final result is in b_q_out/b_qd_out, so copy back to b_q/b_qd
+        if (iterations % 2 != 0) {
+            VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
+            vkCmdCopyBuffer(cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
+            VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
+            vkCmdCopyBuffer(cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
+            bar_cmd(cmd);
+        }
+
+        // 4. Restitution phase
+        if (m_config.enable_restitution) {
+            ts_mark(52);
+            cmd_dispatch_c(cmd, sh_rest.pipeline, sh_rest.layout, set_rest, &pc_rest, sizeof(PCRest),
+                           (uint32_t)((m_contact_max + 63) / 64));
+            ts_mark(53);
+            qidx = 54;
+        }
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+    }
+
+    // Submit substep command buffers in chunks to stay well under the Windows TDR limit
+    int batch_size = m_config.substep_batch_size > 0 ? m_config.substep_batch_size : 15;
+    for (int start = 0; start < substeps; start += batch_size) {
+        int count = std::min(batch_size, substeps - start);
+        VK_CHECK(vkResetFences(m_ctx.device, 1, &m_frame_fence));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = (uint32_t)count;
+        si.pCommandBuffers = &m_substep_cmds[start];
+        VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, m_frame_fence));
+        VK_CHECK(vkWaitForFences(m_ctx.device, 1, &m_frame_fence, VK_TRUE, UINT64_MAX));
+    }
+
+    // Read query pool results if profiling enabled (across all substeps)
+    if (m_profiling_enabled && m_query_pool) {
+        uint32_t queries_per_sub = m_config.enable_restitution ? 54 : 52;
+        double period_ns = double(m_ctx.props.limits.timestampPeriod);
+        std::vector<uint64_t> qres(queries_per_sub, 0);
+
+        for (int sub = 0; sub < substeps; sub++) {
+            uint32_t q_base = (uint32_t)sub * 64;
+            VkResult res = vkGetQueryPoolResults(m_ctx.device, m_query_pool, q_base, queries_per_sub,
+                                                 queries_per_sub * sizeof(uint64_t), qres.data(), sizeof(uint64_t),
+                                                 VK_QUERY_RESULT_64_BIT);
+            if (res == VK_SUCCESS) {
+                auto get_ms = [&](uint32_t s, uint32_t e) -> double {
+                    if (e < queries_per_sub && s < queries_per_sub && qres[e] >= qres[s] && qres[s] > 0) {
+                        return double(qres[e] - qres[s]) * period_ns * 1e-6;
+                    }
+                    return 0.0;
+                };
+
+                m_prof_time_contact_gen += get_ms(0, 1);
+                m_prof_time_init_copies += get_ms(2, 3);
+                m_prof_time_integrate += get_ms(4, 5);
+                m_prof_time_int_copies += get_ms(6, 7);
+                m_prof_time_grid_indices += get_ms(8, 9);
+
+                // Sort passes (3 passes: 0, 1, 2)
+                for (uint32_t p = 0; p < 3; p++) {
+                    uint32_t base = 10 + p * 6;
+                    m_prof_time_sort_hist[p] += get_ms(base, base + 1);
+                    m_prof_time_sort_scan[p] += get_ms(base + 2, base + 3);
+                    m_prof_time_sort_scatter[p] += get_ms(base + 4, base + 5);
+                }
+
+                m_prof_time_cell_fills += get_ms(28, 29);
+                m_prof_time_grid_offsets += get_ms(30, 31);
+
+                for (int iter = 0; iter < iterations; iter++) {
+                    uint32_t ibase = 32 + iter * 10;
+                    m_prof_time_solve_shape += get_ms(ibase, ibase + 1);
+                    m_prof_time_solve_pp += get_ms(ibase + 2, ibase + 3);
+                    m_prof_time_iter_copies += get_ms(ibase + 4, ibase + 5);
+                    m_prof_time_apply_deltas += get_ms(ibase + 6, ibase + 7);
+                    m_prof_time_iter_copies += get_ms(ibase + 8, ibase + 9);
+                }
+
+                if (m_config.enable_restitution) {
+                    m_prof_time_restitution += get_ms(52, 53);
+                }
+                m_prof_substep_count++;
             }
         }
+    }
 
-        // Restitution phase (mirrors Warp's apply_particle_shape_restitution after iterations)
-        if (m_config.enable_restitution && m_contact_count > 0) {
-            cmd_dispatch(sh_rest.pipeline, sh_rest.layout, set_rest, &pc_rest, sizeof(PCRest),
-                         (uint32_t)((m_contact_count + 63) / 64));
-        }
+    auto step_wall_t1 = std::chrono::high_resolution_clock::now();
+    if (m_profiling_enabled) {
+        m_prof_wall_time_ms += std::chrono::duration<double, std::milli>(step_wall_t1 - step_wall_t0).count();
+    }
 
-        VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
-        {
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &m_ctx.cmd;
-            VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(m_ctx.compute_queue));
+    // Optional debug verification of sort ordering (zero-overhead if unset)
+    static int check_sort_order_env = -1;
+    if (check_sort_order_env == -1) {
+        const char* e = std::getenv("VKXPBD_CHECK_SORT_ORDER");
+        check_sort_order_env = (e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0)) ? 1 : 0;
+    }
+    if (check_sort_order_env == 1) {
+        auto keys = get_sorted_cells();
+        bool ok = true;
+        for (size_t i = 1; i < keys.size(); i++) {
+            if (keys[i] < keys[i - 1]) {
+                fprintf(stderr, "[VKXPBD SORT CHECK ERROR] keys[%zu] = %u < keys[%zu] = %u!\n",
+                        i, keys[i], i - 1, keys[i - 1]);
+                ok = false;
+                break;
+            }
         }
-        vkResetCommandBuffer(m_ctx.cmd, 0);
+        if (ok) {
+            printf("[VKXPBD DEBUG] Sort check passed: %zu keys strictly non-decreasing.\n", keys.size());
+        }
+    }
+
+    // Keep ONE contact download per frame for stats/reporting
+    {
+        auto cc = b_cc.download(4);
+        m_contact_count = *reinterpret_cast<int32_t*>(cc.data());
+        if (m_contact_count > (int)m_contact_max) m_contact_count = (int)m_contact_max;
     }
 }
 
@@ -864,23 +1161,12 @@ void XpbdSolver::step_solve_only(float dt, int substeps, int iterations) {
         pc_con.sub_index = sub;
         pc_app.sub_index = sub;
 
-        // Step phase (integrate + grid — contact gen SKIPPED)
         VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
-        {
-            VkBufferCopy c{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_init.buffer, 1, &c);
-            vkCmdCopyBuffer(m_ctx.cmd, b_qd.buffer, b_qd_init.buffer, 1, &c);
-            bar();
-        }
+
+        // Step phase: in-place integrate
         cmd_dispatch(sh_int.pipeline, sh_int.layout, set_int, &pc_int, sizeof(PCInt),
                      (uint32_t)((m_n_parts + 63) / 64));
-        {
-            VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_q_out.buffer, b_q.buffer, 1, &c1);
-            VkBufferCopy c2{0, 0, m_n_parts * 4 * 4};
-            vkCmdCopyBuffer(m_ctx.cmd, b_qd_out.buffer, b_qd.buffer, 1, &c2);
-            bar();
-        }
+        bar();
         cmd_dispatch(sh_gci.pipeline, sh_gci.layout, set_gci, &pc_gci, sizeof(PCGci),
                      (uint32_t)((m_n_parts + 63) / 64));
         vkCmdFillBuffer(m_ctx.cmd, m_sorter.global_hist.buffer, 0, m_sorter.global_hist.size, 0);
@@ -892,31 +1178,19 @@ void XpbdSolver::step_solve_only(float dt, int substeps, int iterations) {
         bar();
         cmd_dispatch(sh_goff.pipeline, sh_goff.layout, set_goff, &pc_goff, sizeof(PCGOff),
                      (uint32_t)((m_n_parts + 63) / 64));
-        VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
-        {
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &m_ctx.cmd;
-            VK_CHECK(vkQueueSubmit(m_ctx.compute_queue, 1, &si, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(m_ctx.compute_queue));
-        }
-        vkResetCommandBuffer(m_ctx.cmd, 0);
 
-        // Iteration loop (using pre-injected contacts)
-        VK_CHECK(vkBeginCommandBuffer(m_ctx.cmd, &bi));
+        // Iteration loop (using pre-injected contacts, sized to contact_max with GPU early-out)
         for (int iter = 0; iter < iterations; iter++) {
             pc_con.iter_index = iter;
             pc_pcon.iter_index = uint32_t(iter);
             vkCmdFillBuffer(m_ctx.cmd, b_delta.buffer, 0, m_n_parts * 3 * 4, 0);
             bar();
-            if (m_contact_count > 0) {
-                cmd_dispatch(sh_con.pipeline, sh_con.layout, set_con, &pc_con, sizeof(PCCon),
-                             (uint32_t)((m_contact_count + 63) / 64));
-                bar();
-            }
+
+            cmd_dispatch(sh_con.pipeline, sh_con.layout, set_con, &pc_con, sizeof(PCCon),
+                         (uint32_t)((m_contact_max + 63) / 64));
+
             cmd_dispatch(sh_pcon.pipeline, sh_pcon.layout, set_pcon, &pc_pcon, sizeof(PCPCon),
                          (uint32_t)((m_n_parts + 63) / 64));
-            bar();
             {
                 VkBufferCopy c1{0, 0, m_n_parts * 4 * 4};
                 vkCmdCopyBuffer(m_ctx.cmd, b_q.buffer, b_q_out.buffer, 1, &c1);
@@ -936,9 +1210,9 @@ void XpbdSolver::step_solve_only(float dt, int substeps, int iterations) {
                 bar();
             }
         }
-        if (m_config.enable_restitution && m_contact_count > 0) {
+        if (m_config.enable_restitution) {
             cmd_dispatch(sh_rest.pipeline, sh_rest.layout, set_rest, &pc_rest, sizeof(PCRest),
-                         (uint32_t)((m_contact_count + 63) / 64));
+                         (uint32_t)((m_contact_max + 63) / 64));
         }
         VK_CHECK(vkEndCommandBuffer(m_ctx.cmd));
         {
@@ -1159,6 +1433,85 @@ std::vector<float> XpbdSolver::get_mesh_bvh_uppers(size_t mesh_index) const {
         uint32_t up = b.uppers[i].packed; u[i*4+3] = *reinterpret_cast<float*>(&up);
     }
     return u;
+}
+
+void XpbdSolver::print_profiler_summary() {
+    if (!m_profiling_enabled || m_prof_substep_count == 0) return;
+
+    double total_sort_ms = 0.0;
+    for (int p = 0; p < 4; p++) {
+        total_sort_ms += m_prof_time_sort_hist[p] + m_prof_time_sort_scan[p] + m_prof_time_sort_scatter[p];
+    }
+    double total_copies_ms = m_prof_time_init_copies + m_prof_time_int_copies + m_prof_time_iter_copies;
+
+    double total_gpu_ms = m_prof_time_contact_gen +
+                          m_prof_time_init_copies +
+                          m_prof_time_integrate +
+                          m_prof_time_int_copies +
+                          m_prof_time_grid_indices +
+                          total_sort_ms +
+                          m_prof_time_cell_fills +
+                          m_prof_time_grid_offsets +
+                          m_prof_time_solve_shape +
+                          m_prof_time_solve_pp +
+                          m_prof_time_iter_copies +
+                          m_prof_time_apply_deltas +
+                          m_prof_time_restitution;
+
+    double idle_gap_ms = m_prof_wall_time_ms > total_gpu_ms ? (m_prof_wall_time_ms - total_gpu_ms) : 0.0;
+    double n_subs = double(m_prof_substep_count);
+
+    printf("\n========================================================================================================\n");
+    printf("                               VKXPBD GPU TIMESTAMP PROFILER SUMMARY                                    \n");
+    printf("========================================================================================================\n");
+    printf("Total Substeps Recorded: %llu\n", (unsigned long long)m_prof_substep_count);
+    printf("Wall-Clock Step Time:    %10.2f ms (%8.4f ms/substep)\n", m_prof_wall_time_ms, m_prof_wall_time_ms / n_subs);
+    printf("Summed GPU Active Time:  %10.2f ms (%8.4f ms/substep)\n", total_gpu_ms, total_gpu_ms / n_subs);
+    printf("Host / Sync Idle Gap:    %10.2f ms (%8.4f ms/substep, %5.1f%% of wall)\n",
+           idle_gap_ms, idle_gap_ms / n_subs, (idle_gap_ms / (m_prof_wall_time_ms > 0.0 ? m_prof_wall_time_ms : 1.0)) * 100.0);
+    printf("--------------------------------------------------------------------------------------------------------\n");
+    printf("%-35s | %10s | %14s | %10s\n", "Kernel / Stage Group", "Total (ms)", "Per-Substep (ms)", "% GPU Time");
+    printf("--------------------------------------------------------------------------------------------------------\n");
+
+    auto print_line = [&](const char* name, double ms) {
+        double pct = (ms / (total_gpu_ms > 0.0 ? total_gpu_ms : 1.0)) * 100.0;
+        printf("%-35s | %10.2f | %14.4f | %9.2f%%\n", name, ms, ms / n_subs, pct);
+    };
+
+    print_line("1. Contact Gen (plane + mesh)", m_prof_time_contact_gen);
+    print_line("2a. Copies: Init (q, qd)", m_prof_time_init_copies);
+    print_line("2b. Integrate (sh_int)", m_prof_time_integrate);
+    print_line("2c. Copies: Integrate (q_out, qd_out)", m_prof_time_int_copies);
+    print_line("2d. Grid Cell Indices (sh_gci)", m_prof_time_grid_indices);
+
+    for (int p = 0; p < 3; p++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "2e. Sort Pass %d: Histogram", p);
+        print_line(buf, m_prof_time_sort_hist[p]);
+        snprintf(buf, sizeof(buf), "2e. Sort Pass %d: Scan (256 WGs)", p);
+        print_line(buf, m_prof_time_sort_scan[p]);
+        snprintf(buf, sizeof(buf), "2e. Sort Pass %d: Scatter", p);
+        print_line(buf, m_prof_time_sort_scatter[p]);
+    }
+
+    print_line("2f. Cell Fills (starts + ends)", m_prof_time_cell_fills);
+    print_line("2g. Grid Offsets (sh_goff)", m_prof_time_grid_offsets);
+    print_line("3a. Solve Shape Contacts (sh_con)", m_prof_time_solve_shape);
+    print_line("3b. Solve PP Contacts (sh_pcon)", m_prof_time_solve_pp);
+    print_line("3c. Copies: Iterations (q, qd)", m_prof_time_iter_copies);
+    print_line("3d. Apply Deltas (sh_app)", m_prof_time_apply_deltas);
+    if (m_config.enable_restitution) {
+        print_line("4.  Restitution (sh_rest)", m_prof_time_restitution);
+    }
+
+    printf("--------------------------------------------------------------------------------------------------------\n");
+    printf("AGGREGATE ROLLUPS:\n");
+    print_line(" -> Total Radix Sort (all passes)", total_sort_ms);
+    print_line(" -> Total Buffer Copies (all groups)", total_copies_ms);
+    print_line(" -> Total Solve Particle-Particle", m_prof_time_solve_pp);
+    print_line(" -> Total Solve Shape Contacts", m_prof_time_solve_shape);
+    printf("========================================================================================================\n\n");
+    fflush(stdout);
 }
 
 } // namespace vkx

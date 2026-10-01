@@ -1,0 +1,54 @@
+// sort_scan_b.comp - Parallel scan of slice totals per bin
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer Scratch { uint scratch[]; };
+layout(std430, binding = 1) writeonly buffer Scanned { uint scanned[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint shift;
+    uint groups;
+    uint num_slices; // total slices = nc * 8
+} pc;
+
+shared uint s_scan[2][256];
+
+void main() {
+    uint bin = gl_WorkGroupID.x;       // 0..255 (one WG per bin)
+    uint lid = gl_LocalInvocationID.x; // 0..255
+    uint total_slices = pc.num_slices;
+
+    uint chunk = (total_slices + 255u) / 256u;
+    uint s0 = min(lid * chunk, total_slices);
+    uint s1 = min(s0 + chunk, total_slices);
+
+    uint sum = 0u;
+    for (uint s = s0; s < s1; s++) {
+        sum += scratch[s * 256u + bin];
+    }
+
+    s_scan[0][lid] = sum;
+    barrier();
+
+    int src = 0;
+    for (uint off = 1u; off < 256u; off <<= 1) {
+        int dst = src ^ 1;
+        s_scan[dst][lid] = (lid >= off) ? (s_scan[src][lid] + s_scan[src][lid - off])
+                                        : s_scan[src][lid];
+        barrier();
+        src = dst;
+    }
+
+    uint running = (lid == 0u) ? 0u : s_scan[src][lid - 1u];
+    if (lid == 255u) {
+        scanned[bin] = s_scan[src][255];
+    }
+
+    for (uint s = s0; s < s1; s++) {
+        uint idx = s * 256u + bin;
+        uint c = scratch[idx];
+        scratch[idx] = running;
+        running += c;
+    }
+}

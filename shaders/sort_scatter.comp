@@ -6,10 +6,10 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer KeysIn { uint keys_in[]; };
 layout(std430, binding = 1) readonly buffer ValsIn { uint vals_in[]; };
-layout(std430, binding = 2) readonly buffer Scanned { uint scanned[]; };     // (consistency check only)
+layout(std430, binding = 2) readonly buffer Scanned { uint scanned[]; };     // Per-bin totals from sort_scan
 layout(std430, binding = 3) writeonly buffer KeysOut { uint keys_out[]; };
 layout(std430, binding = 4) writeonly buffer ValsOut { uint vals_out[]; };
-layout(std430, binding = 5) readonly buffer WgBase { uint wg_base_global[]; }; // global_hist rewritten by scan
+layout(std430, binding = 5) readonly buffer WgBase { uint wg_base_global[]; }; // global_hist within-column prefixes
 layout(std430, binding = 6) buffer PadA { uint pad_a[]; };                     // unused, kept bound
 
 layout(push_constant) uniform PC {
@@ -19,31 +19,51 @@ layout(push_constant) uniform PC {
     uint pad;
 } pc;
 
-shared uint s_keys[256]; // this workgroup's key tile (for stable rank counts)
+shared uint s_keys[256];      // this workgroup's key tile (for stable rank counts)
+shared uint s_bin_base[256];  // exclusive prefix sum over the 256 bin totals
+shared uint s_scan_scratch[2][256]; // Hillis-Steele scratch for bin_base prefix sum
 
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint idx = gl_WorkGroupID.x * 256u + lid;
 
-    // stage the tile once; invalid lanes store a digit-255 sentinel key
+    // 1. Cooperative prefix sum of scanned[0..255] (bin totals) into s_bin_base
+    s_scan_scratch[0][lid] = scanned[lid];
+    barrier();
+
+    int src = 0;
+    for (uint offset = 1; offset < 256; offset <<= 1) {
+        int dst = src ^ 1;
+        if (lid >= offset) {
+            s_scan_scratch[dst][lid] = s_scan_scratch[src][lid] + s_scan_scratch[src][lid - offset];
+        } else {
+            s_scan_scratch[dst][lid] = s_scan_scratch[src][lid];
+        }
+        barrier();
+        src = dst;
+    }
+    // Exclusive scan: element 0 starts at 0
+    s_bin_base[lid] = (lid == 0) ? 0u : s_scan_scratch[src][lid - 1];
+
+    // 2. Stage the tile keys
     uint key = 0xFFFFFFFFu;
     if (idx < pc.n) key = keys_in[idx];
     s_keys[lid] = key;
     barrier();
-    memoryBarrierShared();
 
     if (idx >= pc.n) return;
     uint val = vals_in[idx];
     uint digit = (key >> pc.shift) & 0xFFu;
 
-    // stable rank: count same-digit elements at earlier tile positions
+    // 3. Stable rank: count same-digit elements at earlier tile positions
     uint rank = 0;
     for (uint j = 0; j < 256u; j++) {
         if (j >= lid) break;
         if (((s_keys[j] >> pc.shift) & 0xFFu) == digit) rank++;
     }
 
-    uint base = wg_base_global[gl_WorkGroupID.x * 256u + digit];
+    // Combined base = global bin start offset + this workgroup's within-bin prefix
+    uint base = s_bin_base[digit] + wg_base_global[gl_WorkGroupID.x * 256u + digit];
     uint slot = base + rank;
 
     keys_out[slot] = key;

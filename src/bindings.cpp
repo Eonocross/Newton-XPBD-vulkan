@@ -32,7 +32,9 @@ PYBIND11_MODULE(vkxpbd, m) {
         .def_readwrite("compat_mode", &vkx::SolverConfig::compat_mode)
         .def_readwrite("enable_validation", &vkx::SolverConfig::enable_validation)
         .def_readwrite("enable_diagnostics", &vkx::SolverConfig::enable_diagnostics)
+        .def_readwrite("enable_profile", &vkx::SolverConfig::enable_profile)
         .def_readwrite("max_diag_pairs", &vkx::SolverConfig::max_diag_pairs)
+        .def_readwrite("substep_batch_size", &vkx::SolverConfig::substep_batch_size)
         .def_property("gravity",
             [](const vkx::SolverConfig& c) {
                 return std::vector<float>{c.gravity[0], c.gravity[1], c.gravity[2]};
@@ -294,6 +296,7 @@ PYBIND11_MODULE(vkxpbd, m) {
             py::array_t<float> result({v.size() / 4, (size_t)4});
             std::memcpy(result.request().ptr, v.data(), v.size() * sizeof(float));
             return result;
-        });
+        })
+        .def("print_profiler_summary", &vkx::XpbdSolver::print_profiler_summary);
 }
 

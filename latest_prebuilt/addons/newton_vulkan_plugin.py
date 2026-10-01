@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Newton Vulkan Direct Physics",
     "author": "Eonocross",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Newton",
     "description": "Bit-exact Vulkan compute backend for Newton XPBD physics simulation in Blender",
@@ -36,6 +36,13 @@ addon_dir = os.path.dirname(os.path.abspath(__file__))
 local_modules = os.path.join(addon_dir, "modules")
 if os.path.exists(local_modules) and local_modules not in sys.path:
     sys.path.insert(0, local_modules)
+
+# Register Mesa Lavapipe CPU Vulkan driver if present - dont use it its crap, use integrated graphics with compat mode if no discrete gpu
+mesa_json = os.path.join(local_modules, "mesa_lavapipe", "lvp_icd.x86_64.json")
+if os.path.exists(mesa_json):
+    existing_drivers = os.environ.get("VK_ADD_DRIVER_FILES", "")
+    if mesa_json not in existing_drivers:
+        os.environ["VK_ADD_DRIVER_FILES"] = f"{existing_drivers};{mesa_json}" if existing_drivers else mesa_json
 
 try:
     import vkxpbd
@@ -436,9 +443,16 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
         except Exception:
             cfg.device_index = -1
 
-        # Only enable validation layers and diagnostic readback buffers in VERBOSE mode
-        cfg.enable_validation = (log_lvl == 'VERBOSE')
-        cfg.enable_diagnostics = (log_lvl == 'VERBOSE')
+        # Only enable validation layers and diagnostic readback buffers in VERBOSE mode.
+        # MINIMAL and STANDARD strictly disable validation layers for maximum performance.
+        if log_lvl == 'VERBOSE':
+            cfg.enable_validation = True
+            cfg.enable_diagnostics = True
+        else:
+            cfg.enable_validation = os.environ.get('VKXPBD_VALIDATION', '0') in ('1', 'true', 'TRUE')
+            cfg.enable_diagnostics = False
+        if hasattr(cfg, 'enable_profile'):
+            cfg.enable_profile = os.environ.get('VKXPBD_PROFILE', '0') in ('1', 'true', 'TRUE')
 
         # Maximum potential contacts: at most 1 contact per shape per particle
         num_shapes = len(collected_meshes) + (1 if props.has_ground_plane else 0)
@@ -688,6 +702,8 @@ class NEWTONVK_OT_simulate(bpy.types.Operator):
             f"{'='*80}\n"
         )
         print(summary_text, flush=True)
+        if hasattr(solver, "print_profiler_summary"):
+            solver.print_profiler_summary()
 
         if log_lvl in ('STANDARD', 'VERBOSE'):
             with open(log_path, "a", encoding="utf-8") as f_log:

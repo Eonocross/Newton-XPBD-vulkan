@@ -1,0 +1,40 @@
+// sort_scan_c.comp - Coalesced in-place rewrite of global_hist with exclusive prefix
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer GlobalHist { uint global_hist[]; };
+layout(std430, binding = 1) readonly buffer Scratch { uint scratch[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint shift;
+    uint groups;
+    uint nc;       // number of row chunks
+} pc;
+
+const uint ROWS_PER_WARP = 16u;
+
+void main() {
+    uint bin_tile = gl_WorkGroupID.x;  // 0..7
+    uint chunk_id = gl_WorkGroupID.y;  // 0..nc-1
+    uint lid = gl_LocalInvocationID.x; // 0..255
+    uint lane = lid % 32u;
+    uint warp_id = lid / 32u;          // 0..7
+
+    uint bin = bin_tile * 32u + lane;
+    uint s = chunk_id * 8u + warp_id;  // global slice index
+
+    uint g0 = s * ROWS_PER_WARP;
+    uint g1 = min(g0 + ROWS_PER_WARP, pc.groups);
+
+    // Read the exclusive prefix base for this slice from scratch
+    uint running = scratch[s * 256u + bin];
+
+    // Rewrite this slice's rows with the exclusive prefix
+    for (uint g = g0; g < g1; g++) {
+        uint idx = g * 256u + bin;
+        uint c = global_hist[idx];
+        global_hist[idx] = running;
+        running += c;
+    }
+}

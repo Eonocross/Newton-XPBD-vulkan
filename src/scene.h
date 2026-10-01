@@ -35,7 +35,9 @@ struct SolverConfig {
     bool compat_mode = false;
     bool enable_validation = false;
     bool enable_diagnostics = false;
+    bool enable_profile = false;
     uint32_t max_diag_pairs = 100000;
+    int substep_batch_size = 15;
 };
 
 struct GPUPairRecord {
@@ -130,10 +132,32 @@ public:
     std::vector<float> get_shape_contact_diag();
     std::vector<uint32_t> get_mesh_candidate_diag();
 
+    void print_profiler_summary();
+
 private:
     void init_pipelines();
     void record_dispatch(VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
                          void* pc, size_t pc_size, uint32_t groups);
+
+    bool m_profiling_enabled = false;
+    VkQueryPool m_query_pool = VK_NULL_HANDLE;
+    double m_prof_time_init_copies = 0.0;
+    double m_prof_time_integrate = 0.0;
+    double m_prof_time_int_copies = 0.0;
+    double m_prof_time_grid_indices = 0.0;
+    double m_prof_time_sort_hist[4] = {0.0, 0.0, 0.0, 0.0};
+    double m_prof_time_sort_scan[4] = {0.0, 0.0, 0.0, 0.0};
+    double m_prof_time_sort_scatter[4] = {0.0, 0.0, 0.0, 0.0};
+    double m_prof_time_cell_fills = 0.0;
+    double m_prof_time_grid_offsets = 0.0;
+    double m_prof_time_solve_shape = 0.0;
+    double m_prof_time_solve_pp = 0.0;
+    double m_prof_time_iter_copies = 0.0;
+    double m_prof_time_apply_deltas = 0.0;
+    double m_prof_time_restitution = 0.0;
+    double m_prof_time_contact_gen = 0.0;
+    uint64_t m_prof_substep_count = 0;
+    double m_prof_wall_time_ms = 0.0;
 
     // Context must be declared FIRST so it is initialized before resources,
     // and destructed LAST (after all Buffers, Pipelines, and Descriptors are destroyed).
@@ -184,14 +208,22 @@ private:
     VkDescriptorSet set_mesh = VK_NULL_HANDLE;
     VkDescriptorSet set_int = VK_NULL_HANDLE;
     VkDescriptorSet set_con = VK_NULL_HANDLE;
+    VkDescriptorSet set_con_flip = VK_NULL_HANDLE;
     VkDescriptorSet set_pcon = VK_NULL_HANDLE;
+    VkDescriptorSet set_pcon_flip = VK_NULL_HANDLE;
     VkDescriptorSet set_app = VK_NULL_HANDLE;
+    VkDescriptorSet set_app_flip = VK_NULL_HANDLE;
     VkDescriptorSet set_gci = VK_NULL_HANDLE;
     VkDescriptorSet set_goff = VK_NULL_HANDLE;
     VkDescriptorSet set_rest = VK_NULL_HANDLE;
 
     bool m_initialized = false;
     bool m_meshes_finalized = false;
+
+    // Frame-level command buffers and synchronization
+    std::vector<VkCommandBuffer> m_substep_cmds;
+    VkFence m_frame_fence = VK_NULL_HANDLE;
+    uint32_t m_query_pool_capacity = 0;
 };
 
 } // namespace vkx

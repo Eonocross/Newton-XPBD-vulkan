@@ -143,64 +143,66 @@ void main() {
                 int e = cell_ends[cell];
                 for (int k = s; k < e; k++) {
                     int j = point_ids[k];
+                    if (j == i) continue;
                     int nflag = flags_arr[j];
-                    bool nactive = (nflag & 1) != 0;
-                    bool proxy_ok = (is_proxy == 0) || (((nflag & 2) == 0) && (invmass[j] > 0.0));
-                    if (nactive && proxy_ok && j != i) {
-                        vec3 raw_diff = x - x_arr[j].xyz;
-                        vec3 nn = raw_diff;
-                        float d = exact_length(nn);
-                        float err = d - radius - radius_arr[j];
+                    if ((nflag & 1) == 0) continue;
+                    if (is_proxy != 0 && (((nflag & 2) != 0) || (invmass[j] <= 0.0))) continue;
 
-                        float w2 = invmass[j];
-                        float denom = w1 + w2;
+                    vec3 raw_diff = x - x_arr[j].xyz;
+                    if (abs(raw_diff.x) > R || abs(raw_diff.y) > R || abs(raw_diff.z) > R) continue;
 
-                        if (err <= pc.k_cohesion && denom > 0.0 && d > 0.0) {
-                            nn = exact_div(nn, d);
-                            vec3 vrel = v - v_arr[j].xyz;
+                    vec3 nn = raw_diff;
+                    float d = exact_length(nn);
+                    float err = d - radius - radius_arr[j];
+                    if (err > pc.k_cohesion || d <= 0.0) continue;
 
-                            float lambda_n = err;
-                            vec3 delta_n = nn * lambda_n;
+                    float w2 = invmass[j];
+                    float denom = w1 + w2;
+                    if (denom <= 0.0) continue;
 
-                            float vn = exact_dot(nn, vrel);
-                            precise vec3 vt = fma(vec3(vn), -nn, vrel);
+                    nn = exact_div(nn, d);
+                    vec3 vrel = v - v_arr[j].xyz;
 
-                            float vt_len = exact_length(vt);
-                            float lambda_f = max(pc.k_mu * lambda_n, -vt_len * pc.dt);
-                            precise vec3 vt_dir = vt_len > 0.0 ? exact_div(vt, vt_len) : vec3(0.0);
-                            precise vec3 p2 = nn * err;
-                            precise vec3 diff = fma(vt_dir, vec3(lambda_f), -p2);
-                            vec3 pair_d = exact_div(diff, denom);
-                            delta += pair_d;
+                    float lambda_n = err;
+                    vec3 delta_n = nn * lambda_n;
 
-                            if (pc.enable_diagnostics != 0u) {
-                                uint slot = atomicAdd(diag_header[0], 1u);
-                                if (slot < pc.max_diag_pairs) {
-                                    vec3 d_i = fma(fma(pair_d, vec3(w1), vec3(0.0)), vec3(pc.relaxation), vec3(0.0));
-                                    diag_pairs[slot].i = uint(i);
-                                    diag_pairs[slot].j = uint(j);
-                                    diag_pairs[slot].dist = d;
-                                    diag_pairs[slot].err = err;
-                                    diag_pairs[slot].normal_x = nn.x;
-                                    diag_pairs[slot].normal_y = nn.y;
-                                    diag_pairs[slot].normal_z = nn.z;
-                                    diag_pairs[slot].vrel_x = vrel.x;
-                                    diag_pairs[slot].vrel_y = vrel.y;
-                                    diag_pairs[slot].vrel_z = vrel.z;
-                                    diag_pairs[slot].vn = vn;
-                                    diag_pairs[slot].vt_len = vt_len;
-                                    diag_pairs[slot].denom = denom;
-                                    diag_pairs[slot].lambda_n = lambda_n;
-                                    diag_pairs[slot].lambda_f = lambda_f;
-                                    diag_pairs[slot].delta_ix = d_i.x;
-                                    diag_pairs[slot].delta_iy = d_i.y;
-                                    diag_pairs[slot].delta_iz = d_i.z;
-                                    diag_pairs[slot].iter_index = pc.iter_index;
-                                    diag_pairs[slot].pad0 = 0u;
-                                } else {
-                                    atomicAdd(diag_header[1], 1u); // overflow counter
-                                }
-                            }
+                    float vn = exact_dot(nn, vrel);
+                    precise vec3 vt = fma(vec3(vn), -nn, vrel);
+
+                    float vt_len = exact_length(vt);
+                    float lambda_f = max(pc.k_mu * lambda_n, -vt_len * pc.dt);
+                    precise vec3 vt_dir = vt_len > 0.0 ? exact_div(vt, vt_len) : vec3(0.0);
+                    precise vec3 p2 = nn * err;
+                    precise vec3 diff = fma(vt_dir, vec3(lambda_f), -p2);
+                    vec3 pair_d = exact_div(diff, denom);
+                    delta += pair_d;
+
+                    if (pc.enable_diagnostics != 0u) {
+                        uint slot = atomicAdd(diag_header[0], 1u);
+                        if (slot < pc.max_diag_pairs) {
+                            vec3 d_i = fma(fma(pair_d, vec3(w1), vec3(0.0)), vec3(pc.relaxation), vec3(0.0));
+                            diag_pairs[slot].i = uint(i);
+                            diag_pairs[slot].j = uint(j);
+                            diag_pairs[slot].dist = d;
+                            diag_pairs[slot].err = err;
+                            diag_pairs[slot].normal_x = nn.x;
+                            diag_pairs[slot].normal_y = nn.y;
+                            diag_pairs[slot].normal_z = nn.z;
+                            diag_pairs[slot].vrel_x = vrel.x;
+                            diag_pairs[slot].vrel_y = vrel.y;
+                            diag_pairs[slot].vrel_z = vrel.z;
+                            diag_pairs[slot].vn = vn;
+                            diag_pairs[slot].vt_len = vt_len;
+                            diag_pairs[slot].denom = denom;
+                            diag_pairs[slot].lambda_n = lambda_n;
+                            diag_pairs[slot].lambda_f = lambda_f;
+                            diag_pairs[slot].delta_ix = d_i.x;
+                            diag_pairs[slot].delta_iy = d_i.y;
+                            diag_pairs[slot].delta_iz = d_i.z;
+                            diag_pairs[slot].iter_index = pc.iter_index;
+                            diag_pairs[slot].pad0 = 0u;
+                        } else {
+                            atomicAdd(diag_header[1], 1u); // overflow counter
                         }
                     }
                 }
